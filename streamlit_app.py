@@ -58,16 +58,13 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         
         # --- ULTRA-ROBUST PRICE EXTRACTION LOGIC ---
         
-        # 1. Permissive Hook Regex: 
-        # Catches "FROM ?2999", "JUST ~499", "STARTING @ 99"
+        # 1. Permissive Hook Regex
         hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+(?:/-)?)")
 
-        # 2. Loose Price Regex: 
-        # Catches "₹29,999", "Rs. 999", "INR 499", "?2999"
+        # 2. Loose Price Regex
         loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+(?:/-)?)")
         
-        # 3. Suffix Price Regex:
-        # Catches "999/-" (Common in India)
+        # 3. Suffix Price Regex
         suffix_price_regex = re.compile(r"([\d,.]+/-)")
         
         # 4. Offer Regex
@@ -124,8 +121,8 @@ def display_full_data(df_sorted, metric, image_name_col):
     st.markdown("--- \n ## 1. Detailed Data (Debug View)")
     st.markdown("Check the **'Raw Text'** column to see exactly what the AI read.")
     
-    cols = [image_name_col, metric, 'extracted_price', 'extracted_offer', 'callout_type', 'raw_text', 'has_face']
-    # Filter to ensure we only ask for columns that exist
+    # Ensure columns exist before selecting
+    cols = [image_name_col, metric, 'has_face', 'extracted_price', 'extracted_offer', 'callout_type', 'raw_text']
     cols = [c for c in cols if c in df_sorted.columns]
     
     st.dataframe(df_sorted[cols], use_container_width=True)
@@ -134,7 +131,25 @@ def display_aggregate_report(above_avg_df, below_avg_df, metric):
     st.markdown("--- \n ## 2. Aggregate Analysis: High-Performers vs. Low-Performers")
     st.markdown(f"Comparing **{len(above_avg_df)}** high-performing creatives against **{len(below_avg_df)}** low-performing ones.")
 
-    # --- 1. Brightness Level Distribution ---
+    # --- 1. Face Detection Distribution ---
+    st.markdown("### Human Element (Has Face?)")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Above Average**")
+        if not above_avg_df.empty:
+            # Convert boolean to string for clearer chart
+            face_counts = above_avg_df['has_face'].astype(str).value_counts(normalize=True)
+            # Ensure both True and False are present for consistent colors
+            face_counts = face_counts.reindex(['True', 'False']).fillna(0)
+            st.bar_chart(face_counts)
+    with col2:
+        st.markdown("**Below Average**")
+        if not below_avg_df.empty:
+            face_counts_below = below_avg_df['has_face'].astype(str).value_counts(normalize=True)
+            face_counts_below = face_counts_below.reindex(['True', 'False']).fillna(0)
+            st.bar_chart(face_counts_below)
+
+    # --- 2. Brightness Level Distribution ---
     st.markdown("### Brightness Level Distribution")
     col1, col2 = st.columns(2)
     with col1:
@@ -146,7 +161,7 @@ def display_aggregate_report(above_avg_df, below_avg_df, metric):
         if not below_avg_df.empty:
             st.bar_chart(below_avg_df['brightness_level'].value_counts(normalize=True))
     
-    # --- 2. Callout Type Distribution ---
+    # --- 3. Callout Type Distribution ---
     st.markdown("### Callout Type Distribution")
     col1, col2 = st.columns(2)
     with col1:
@@ -159,18 +174,6 @@ def display_aggregate_report(above_avg_df, below_avg_df, metric):
         if not below_avg_df.empty:
             callout_counts_below = below_avg_df['callout_type'].value_counts(normalize=True)
             st.bar_chart(callout_counts_below.reindex(["Price + Offer", "Price Hook", "Price Only", "Offer", "None"]).fillna(0))
-
-    # --- 3. Other Features ---
-    st.markdown("### Other Features (as % of group)")
-    bool_data = {
-        "Above Avg (%)": {
-            "Has Face": above_avg_df['has_face'].mean() * 100 if not above_avg_df.empty else 0,
-        },
-        "Below Avg (%)": {
-            "Has Face": below_avg_df['has_face'].mean() * 100 if not below_avg_df.empty else 0,
-        }
-    }
-    st.dataframe(pd.DataFrame(bool_data).T.style.format("{:.1f}%"))
     
     # --- 4. Top Extracted Callouts ---
     st.markdown("### Top Callouts (The \"Why\")")
@@ -214,10 +217,11 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
         st.markdown(f"**{metric}: {best[metric]:.4f}**")
         if best['image_name'] in images_dict:
             st.image(images_dict[best['image_name']], use_column_width=True)
+        
+        st.write(f"**Face Detected:** {'✅ Yes' if best.has_face else '❌ No'}")
         st.write(f"**Extracted Price:** {best.extracted_price or 'N/A'}")
         st.write(f"**Extracted Offer:** {best.extracted_offer or 'N/A'}")
         st.write(f"**Callout Type:** {best.callout_type}")
-        st.write(f"**Face:** {best.has_face}")
         st.write(f"**Brightness:** {best.brightness_level}")
 
     with col2:
@@ -226,10 +230,11 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
         st.markdown(f"**{metric}: {worst[metric]:.4f}**")
         if worst['image_name'] in images_dict:
             st.image(images_dict[worst['image_name']], use_column_width=True)
+        
+        st.write(f"**Face Detected:** {'✅ Yes' if worst.has_face else '❌ No'}")
         st.write(f"**Extracted Price:** {worst.extracted_price or 'N/A'}")
         st.write(f"**Extracted Offer:** {worst.extracted_offer or 'N/A'}")
         st.write(f"**Callout Type:** {worst.callout_type}")
-        st.write(f"**Face:** {worst.has_face}")
         st.write(f"**Brightness:** {worst.brightness_level}")
 
 # --- 3. MAIN APPLICATION UI ---
