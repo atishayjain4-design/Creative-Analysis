@@ -119,6 +119,17 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
 # --- 2. REPORTING FUNCTIONS ---
 
+def display_full_data(df_sorted, metric, image_name_col):
+    """Displays the detailed data table for debugging."""
+    st.markdown("--- \n ## 1. Detailed Data (Debug View)")
+    st.markdown("Check the **'Raw Text'** column to see exactly what the AI read.")
+    
+    cols = [image_name_col, metric, 'extracted_price', 'extracted_offer', 'callout_type', 'raw_text', 'has_face']
+    # Filter to ensure we only ask for columns that exist
+    cols = [c for c in cols if c in df_sorted.columns]
+    
+    st.dataframe(df_sorted[cols], use_container_width=True)
+
 def display_aggregate_report(above_avg_df, below_avg_df, metric):
     st.markdown("--- \n ## 2. Aggregate Analysis: High-Performers vs. Low-Performers")
     st.markdown(f"Comparing **{len(above_avg_df)}** high-performing creatives against **{len(below_avg_df)}** low-performing ones.")
@@ -228,7 +239,7 @@ st.title("Creative Analysis Dashboard")
 
 st.sidebar.header("1. Upload Files")
 csv_file = st.sidebar.file_uploader("Upload Metrics CSV", type="csv")
-uploaded_images = st.sidebar.file_uploader("Upload Creative Images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+uploaded_images = st.sidebar.file_uploader("Upload all your Creative Images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
 st.sidebar.header("2. Configure Columns")
 metric_col = st.sidebar.text_input("Metric Column (e.g. CTR)", "CTR")
