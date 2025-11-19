@@ -6,6 +6,7 @@ import re
 import os
 import easyocr
 from io import BytesIO
+from collections import Counter # New import for counting phrases
 
 # --- 1. FEATURE EXTRACTION FUNCTIONS ---
 
@@ -13,10 +14,8 @@ from io import BytesIO
 def load_models():
     """Loads OpenCV and EasyOCR models into memory."""
     print("Loading models...")
-    # This file MUST be in your GitHub repository
     cascade_path = 'haarcascade_frontalface_default.xml'
     
-    # Check if the file exists and give a clear error if it doesn't
     if not os.path.exists(cascade_path):
         st.error(f"Fatal Error: `{cascade_path}` not found.")
         st.error("Please download this file and upload it to your GitHub repository:")
@@ -25,8 +24,6 @@ def load_models():
         
     face_cascade = cv2.CascadeClassifier(cascade_path)
     
-    # Load OCR Model
-    # This will be downloaded by the Streamlit server the first time it runs.
     print("Loading EasyOCR model (this may take a moment)...")
     ocr_reader = easyocr.Reader(['en'], gpu=False)
     print("Models loaded successfully.")
@@ -47,32 +44,46 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         has_face = len(faces) > 0
         
         brightness = np.mean(gray)
-        if brightness < 90:
-            brightness_level = "Low (Dark)"
-        elif brightness < 180:
-            brightness_level = "Medium (Balanced)"
-        else:
-            brightness_level = "High (Bright)"
-            
+        if brightness < 90: brightness_level = "Low (Dark)"
+        elif brightness < 180: brightness_level = "Medium (Balanced)"
+        else: brightness_level = "High (Bright)"
         contrast = np.std(gray)
 
         # --- OCR Features ---
-        # easyocr can read directly from bytes
         results = ocr_reader.readtext(image_bytes, detail=0, paragraph=True)
-        extracted_text = " ".join(results)
+        extracted_text = " ".join(results).upper() # Convert to uppercase for easier matching
         
         has_text = len(extracted_text.strip()) > 5
         
-        # Smarter Callout Analysis
-        offer_regex = re.compile(r'(SALE|OFF|%|FREE|SAVE|DEAL|BOGO)', re.IGNORECASE)
-        price_point_regex = re.compile(r'(\$|€|£|₹|From|Starts at|Starting at|Only)\s?[\d,.]+', re.IGNORECASE)
+        # --- NEW: Upgraded Callout Extraction ---
+        # Regex with CAPTURING GROUPS (the parentheses) to extract the *actual* text.
         
-        if price_point_regex.search(extracted_text):
-            callout_type = "Price Point (e.g. $299)"
-        elif offer_regex.search(extracted_text):
-            callout_type = "Offer (e.g. Sale, % Off)"
-        else:
-            callout_type = "None"
+        # This regex looks for things like "FROM ₹29,999", "$19.99", "ONLY ₹300"
+        price_regex = re.compile(r"((?:FROM|STARTS AT|STARTING AT|ONLY)\s*(?:₹|\$|€|£)\s*[\d,.]+|(?:\$|€|£|₹)\s*[\d,.]+)")
+        
+        # This regex looks for "50% OFF", "SALE", "FREE SHIPPING", etc.
+        offer_regex = re.compile(r"(\d{1,2}\s?% (?:OFF)?|SALE|FREE SHIPPING|FREE|BOGO|DEAL|OFFER)")
+        
+        callout_type = "None"
+        extracted_price = None
+        extracted_offer = None
+
+        price_match = price_regex.search(extracted_text)
+        offer_match = offer_regex.search(extracted_text)
+        
+        if price_match:
+            callout_type = "Price Point"
+            extracted_price = price_match.group(1) # Get the text from the first capturing group
+        
+        # An ad can have both a price AND an offer (e.g., "$29.99 - 50% OFF")
+        if offer_match:
+            # If it already had a price, just add the offer.
+            # If not, set the callout type.
+            if callout_type == "Price Point":
+                callout_type = "Price + Offer"
+            else:
+                callout_type = "Offer"
+            extracted_offer = offer_match.group(1)
 
         return {
             "has_face": has_face,
@@ -81,14 +92,15 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             "contrast": contrast,
             "has_text": has_text,
             "callout_type": callout_type,
-            "extracted_text": extracted_text.strip()[:75] + "..." if has_text else "N/A"
+            "extracted_price": extracted_price, # NEW
+            "extracted_offer": extracted_offer, # NEW
+            "extracted_text_snippet": extracted_text.strip()[:75] + "..." if has_text else "N/A"
         }
     except Exception as e:
-        # Log the error to the Streamlit console for debugging
         print(f"Error analyzing image: {e}") 
         return {"error": str(e)}
 
-# --- 2. REPORTING FUNCTIONS ---
+# --- 2. REPORTING FUNCTIONS (UPGRADED) ---
 
 def display_aggregate_report(above_avg_df, below_avg_df, metric):
     st.markdown("--- \n ## 2. Aggregate Analysis: High-Performers vs. Low-Performers")
@@ -109,10 +121,13 @@ def display_aggregate_report(above_avg_df, below_avg_df, metric):
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("Above Average")
-        st.bar_chart(above_avg_df['callout_type'].value_counts(normalize=True))
+        # Re-order the index for a consistent chart
+        callout_counts_above = above_avg_df['callout_type'].value_counts(normalize=True)
+        st.bar_chart(callout_counts_above.reindex(["Price + Offer", "Price Point", "Offer", "None"]).fillna(0))
     with col2:
         st.markdown("Below Average")
-        st.bar_chart(below_avg_df['callout_type'].value_counts(normalize=True))
+        callout_counts_below = below_avg_df['callout_type'].value_counts(normalize=True)
+        st.bar_chart(callout_counts_below.reindex(["Price + Offer", "Price Point", "Offer", "None"]).fillna(0))
 
     # --- 3. Other Features ---
     st.markdown("### Other Features (as % of group)")
@@ -127,6 +142,37 @@ def display_aggregate_report(above_avg_df, below_avg_df, metric):
         }
     }
     st.dataframe(pd.DataFrame(bool_data).T.style.format("{:.1f}%"))
+    
+    # --- 4. NEW: Top Extracted Callouts (The "Why") ---
+    st.markdown("### Top Callouts (The \"Why\")")
+    st.markdown("This shows the *exact* callouts that appeared most often in each group.")
+    
+    # Helper to create a frequency DataFrame
+    def get_top_phrases(series):
+        # Count non-null values
+        counts = Counter(series.dropna()).most_common(5)
+        if not counts:
+            return pd.DataFrame(columns=["Phrase", "Count"])
+        return pd.DataFrame(counts, columns=["Phrase", "Count"])
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("#### Top Prices (Above Avg)")
+        top_prices_above = get_top_phrases(above_avg_df['extracted_price'])
+        st.dataframe(top_prices_above, use_container_width=True)
+        
+        st.markdown("#### Top Offers (Above Avg)")
+        top_offers_above = get_top_phrases(above_avg_df['extracted_offer'])
+        st.dataframe(top_offers_above, use_container_width=True)
+    
+    with col2:
+        st.markdown("#### Top Prices (Below Avg)")
+        top_prices_below = get_top_phrases(below_avg_df['extracted_price'])
+        st.dataframe(top_prices_below, use_container_width=True)
+        
+        st.markdown("#### Top Offers (Below Avg)")
+        top_offers_below = get_top_phrases(below_avg_df['extracted_offer'])
+        st.dataframe(top_offers_below, use_container_width=True)
 
 
 def display_best_vs_worst(df_sorted, metric, images_dict):
@@ -147,7 +193,10 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
         st.markdown(f"**{metric}: {best[metric]:.4f}**")
         if best['image_name'] in images_dict:
             st.image(images_dict[best['image_name']], use_column_width=True)
-        st.write(f"**Callout:** {best.callout_type}")
+        # Display new extracted fields
+        st.write(f"**Callout Type:** {best.callout_type}")
+        st.write(f"**Extracted Price:** {best.extracted_price or 'N/A'}")
+        st.write(f"**Extracted Offer:** {best.extracted_offer or 'N/A'}")
         st.write(f"**Face:** {best.has_face}")
         st.write(f"**Brightness:** {best.brightness_level}")
 
@@ -157,11 +206,14 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
         st.markdown(f"**{metric}: {worst[metric]:.4f}**")
         if worst['image_name'] in images_dict:
             st.image(images_dict[worst['image_name']], use_column_width=True)
-        st.write(f"**Callout:** {worst.callout_type}")
+        # Display new extracted fields
+        st.write(f"**Callout Type:** {worst.callout_type}")
+        st.write(f"**Extracted Price:** {worst.extracted_price or 'N/A'}")
+        st.write(f"**Extracted Offer:** {worst.extracted_offer or 'N/A'}")
         st.write(f"**Face:** {worst.has_face}")
         st.write(f"**Brightness:** {worst.brightness_level}")
 
-# --- 3. MAIN APPLICATION UI ---
+# --- 3. MAIN APPLICATION UI (Mostly Unchanged) ---
 
 st.set_page_config(layout="wide")
 st.title("Creative Analysis Dashboard")
@@ -170,7 +222,6 @@ st.write("Upload your metrics and image folder to get an automated performance a
 # --- Sidebar for Uploads and Config ---
 st.sidebar.header("1. Upload Files")
 csv_file = st.sidebar.file_uploader("Upload your Metrics CSV", type="csv")
-# Use accept_multiple_files to simulate a folder upload
 uploaded_images = st.sidebar.file_uploader("Upload all your Creative Images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
 st.sidebar.header("2. Configure Columns")
@@ -185,7 +236,7 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             face_cascade, ocr_reader = load_models()
         
         if face_cascade is None or ocr_reader is None:
-            st.stop() # Stop execution if models failed to load
+            st.stop() 
 
         with st.spinner("Parsing CSV..."):
             try:
@@ -202,7 +253,6 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             st.error(f"Error: Metric column '{metric_col}' not found in CSV. Found columns: {list(df.columns)}")
             st.stop()
 
-        # Create a dictionary of image {name: bytes} for easy lookup
         images_dict = {f.name: f.getvalue() for f in uploaded_images}
         
         all_features = []
@@ -216,12 +266,10 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
                 image_bytes = images_dict[image_name]
                 features = analyze_image_features(image_bytes, face_cascade, ocr_reader)
                 
-                # Combine CSV row with extracted features
                 if "error" not in features:
                     combined_data = {**row, **features}
                     all_features.append(combined_data)
             else:
-                # This helps debug if names don't match
                 print(f"Skipping row {index}: Image '{image_name}' not found in uploaded files.") 
             
             progress_bar.progress((index + 1) / total_images, text=f"Analyzing {image_name} ({index + 1}/{total_images})")
@@ -234,19 +282,29 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             # --- Create the Full DataFrame ---
             df_with_features = pd.DataFrame(all_features)
             
-            # Convert metric to numeric
             try:
                 df_with_features[metric_col] = pd.to_numeric(df_with_features[metric_col])
             except ValueError:
                 st.error(f"Error: The metric column '{metric_col}' contains non-numeric values. Please clean your CSV.")
                 st.stop()
             
-            # Sort the DataFrame
             df_sorted = df_with_features.sort_values(by=metric_col, ascending=False)
             
             # --- Display Reports ---
             st.markdown("## 1. Complete Analysis Data Table")
-            st.dataframe(df_sorted[[image_name_col, metric_col, 'callout_type', 'has_face', 'brightness_level', 'extracted_text']])
+            
+            # Define columns to show, including new extracted ones
+            display_cols = [
+                image_name_col, 
+                metric_col, 
+                'callout_type', 
+                'extracted_price', # NEW
+                'extracted_offer', # NEW
+                'has_face', 
+                'brightness_level', 
+                'extracted_text_snippet'
+            ]
+            st.dataframe(df_sorted[display_cols])
 
             # Groups for aggregate analysis
             mean_metric = df_sorted[metric_col].mean()
@@ -260,7 +318,6 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             else:
                 display_aggregate_report(above_avg_df, below_avg_df, metric_col)
                 
-                # We need to pass the *bytes* to the display function
                 best_worst_images = {}
                 if not df_sorted.empty:
                     best_name = df_sorted.iloc[0]['image_name']
