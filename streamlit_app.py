@@ -8,23 +8,26 @@ import easyocr
 from io import BytesIO
 from collections import Counter
 
-# --- 1. FEATURE EXTRACTION FUNCTIONS ---
+# ==========================================
+# 1. FEATURE EXTRACTION FUNCTIONS
+# ==========================================
 
 @st.cache_resource
 def load_models():
     """Loads OpenCV and EasyOCR models into memory."""
     print("Loading models...")
-    # This file MUST be in your GitHub repository
     cascade_path = 'haarcascade_frontalface_default.xml'
     
+    # Check for the face detection model file
     if not os.path.exists(cascade_path):
         st.error(f"Fatal Error: `{cascade_path}` not found.")
-        st.error("Please download this file and upload it to your GitHub repository:")
+        st.error("Please download this file and upload it to your GitHub repository.")
         st.code("https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml")
         return None, None
         
     face_cascade = cv2.CascadeClassifier(cascade_path)
     
+    # Load EasyOCR (English model covers ₹, Rs, and numbers)
     print("Loading EasyOCR model (this may take a moment)...")
     ocr_reader = easyocr.Reader(['en'], gpu=False)
     print("Models loaded successfully.")
@@ -32,195 +35,297 @@ def load_models():
 
 def analyze_image_features(image_bytes, face_cascade, ocr_reader):
     """
-    Analyzes a single image (as bytes) and returns a dictionary of its features.
+    Analyzes a single image (as bytes) and returns all features (CV + Text).
     """
     try:
-        # Convert bytes to OpenCV image
+        # --- A. Computer Vision (CV) Analysis ---
+        
+        # Convert bytes to OpenCV image format
         file_bytes = np.asarray(bytearray(image_bytes), dtype=np.uint8)
         image_cv = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-        # --- CV Features ---
+        # 1. Face Detection
         gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.1, 5)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
         has_face = len(faces) > 0
         
+        # 2. Brightness Calculation
         brightness = np.mean(gray)
         if brightness < 90: brightness_level = "Low (Dark)"
         elif brightness < 180: brightness_level = "Medium (Balanced)"
         else: brightness_level = "High (Bright)"
+        
+        # 3. Contrast Calculation
+        contrast = np.std(gray)
 
-        # --- OCR Features ---
+        # --- B. Text Analysis (OCR & Extraction) ---
+        
+        # 1. Extract Raw Text
         results = ocr_reader.readtext(image_bytes, detail=0, paragraph=True)
-        raw_text = " ".join(results)
+        extracted_text = " ".join(results).upper() # Standardize to Uppercase
+        has_text = len(extracted_text.strip()) > 5
         
-        # Basic Cleaning
-        cleaned_text = raw_text.upper()
-        has_text = len(cleaned_text.strip()) > 5
+        # 2. Advanced Regex for Indian Prices & Hooks
+        # Looks for: "FROM ₹29,999", "JUST RS. 499", "INR 1200", "ONLY ₹500"
+        # It captures the "Hook Word" (optional) + The Currency + The Amount
+        price_regex = re.compile(r"((?:FROM|STARTS? AT|STARTING AT|ONLY|JUST|NOW|AT|FLAT)?\s*(?:₹|\$|€|£|RS\.?|INR)\s*[\d,.]+)")
         
-        # --- SMART PRICE EXTRACTION LOGIC ---
-        
-        # 1. Hook Price Regex: Looks for "FROM ?29,999", "JUST ₹499", "STARTS @ 99"
-        # Note: We explicitly look for '?' because OCR often mistakes ₹ for ?
-        hook_price_regex = re.compile(r"((?:FROM|STARTS?|JUST|ONLY|NOW|AT|@)\s*(?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+)")
-
-        # 2. Loose Price Regex: Looks for "₹29,999" or "?29,999" without the hook words
-        loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+)")
-        
-        # 3. Offer Regex: Looks for "50% OFF", "SALE", "FREE"
+        # 3. Advanced Regex for Offers
+        # Looks for: "50% OFF", "FLAT 20%", "SALE", "BOGO", "FREE SHIPPING"
         offer_regex = re.compile(r"(\d{1,2}\s?% (?:OFF)?|SALE|FREE SHIPPING|FREE|BOGO|DEAL|OFFER|FLAT \d+%)")
         
         callout_type = "None"
         extracted_price = None
         extracted_offer = None
 
-        # Try finding a "Hook" price first (e.g. "From ₹999")
-        hook_match = hook_price_regex.search(cleaned_text)
-        loose_match = loose_price_regex.search(cleaned_text)
-        offer_match = offer_regex.search(cleaned_text)
+        price_matches = price_regex.findall(extracted_text)
+        offer_matches = offer_regex.findall(extracted_text)
         
-        if hook_match:
-            callout_type = "Price Hook"
-            extracted_price = hook_match.group(1)
-        elif loose_match:
-            # Fallback: We found a price, but no "From/Just" word
-            callout_type = "Price Only"
-            extracted_price = loose_match.group(1)
+        # Logic to prioritize the most "significant" price/offer found
+        if price_matches:
+            callout_type = "Price Point"
+            extracted_price = price_matches[0] # Take the first/main price found
         
-        if offer_match:
-            if "Price" in callout_type:
+        if offer_matches:
+            if callout_type == "Price Point":
                 callout_type = "Price + Offer"
             else:
                 callout_type = "Offer"
-            extracted_offer = offer_match.group(1)
-
-        # --- CLEAN UP: Fix common OCR errors ---
-        # If we extracted something like "?29,999", replace the ? with ₹
-        if extracted_price:
-            extracted_price = extracted_price.replace("?", "₹")
+            extracted_offer = offer_matches[0]
 
         return {
             "has_face": has_face,
+            "brightness": brightness,
             "brightness_level": brightness_level,
+            "contrast": contrast,
+            "has_text": has_text,
             "callout_type": callout_type,
             "extracted_price": extracted_price, 
             "extracted_offer": extracted_offer,
-            "raw_text": raw_text # Keep raw text for debugging
+            "extracted_text_snippet": extracted_text.strip()[:75] + "..." if has_text else "N/A"
         }
     except Exception as e:
         print(f"Error analyzing image: {e}") 
         return {"error": str(e)}
 
-# --- 2. REPORTING UI ---
+# ==========================================
+# 2. REPORTING FUNCTIONS
+# ==========================================
 
 def display_aggregate_report(above_avg_df, below_avg_df, metric):
-    st.markdown("--- \n ## 2. Performance Analysis")
-    
+    st.markdown("--- \n ## 2. Aggregate Analysis: High-Performers vs. Low-Performers")
+    st.markdown(f"Comparing **{len(above_avg_df)}** high-performing creatives against **{len(below_avg_df)}** low-performing ones.")
+
+    # --- Chart 1: Brightness ---
+    st.markdown("### Brightness Level Distribution")
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("### Above Average")
-        st.caption(f"Top performers (> avg {metric})")
-        if not above_avg_df.empty:
-            # Group by Price Callout and Count
-            top_prices = Counter(above_avg_df['extracted_price'].dropna()).most_common(5)
-            if top_prices:
-                df_prices = pd.DataFrame(top_prices, columns=["Price Callout", "Count"])
-                st.dataframe(df_prices, use_container_width=True, hide_index=True)
-            else:
-                st.info("No prices extracted in this group.")
+        st.markdown("Above Average")
+        st.bar_chart(above_avg_df['brightness_level'].value_counts(normalize=True))
+    with col2:
+        st.markdown("Below Average")
+        st.bar_chart(below_avg_df['brightness_level'].value_counts(normalize=True))
+    
+    # --- Chart 2: Callout Types ---
+    st.markdown("### Callout Type Distribution")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("Above Average")
+        callout_counts_above = above_avg_df['callout_type'].value_counts(normalize=True)
+        st.bar_chart(callout_counts_above.reindex(["Price + Offer", "Price Point", "Offer", "None"]).fillna(0))
+    with col2:
+        st.markdown("Below Average")
+        callout_counts_below = below_avg_df['callout_type'].value_counts(normalize=True)
+        st.bar_chart(callout_counts_below.reindex(["Price + Offer", "Price Point", "Offer", "None"]).fillna(0))
+
+    # --- Table: Other Features ---
+    st.markdown("### Other Features (as % of group)")
+    bool_data = {
+        "Above Avg (%)": {
+            "Has Face": above_avg_df['has_face'].mean() * 100,
+            "Has Text": above_avg_df['has_text'].mean() * 100
+        },
+        "Below Avg (%)": {
+            "Has Face": below_avg_df['has_face'].mean() * 100,
+            "Has Text": below_avg_df['has_text'].mean() * 100
+        }
+    }
+    st.dataframe(pd.DataFrame(bool_data).T.style.format("{:.1f}%"))
+    
+    # --- Table: Top Extracted Callouts (The "Why") ---
+    st.markdown("### Top Callouts (The \"Why\")")
+    st.markdown("These tables show exactly which **prices** (e.g., '₹999') and **offers** (e.g., '50% OFF') appeared most often in winning vs losing ads.")
+    
+    def get_top_phrases(series):
+        # Count the top 5 most frequent phrases, ignoring N/A
+        counts = Counter(series.dropna()).most_common(5)
+        if not counts:
+            return pd.DataFrame(columns=["Phrase", "Count"])
+        return pd.DataFrame(counts, columns=["Phrase", "Count"])
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("#### Top Prices (Above Avg)")
+        st.dataframe(get_top_phrases(above_avg_df['extracted_price']), use_container_width=True)
+        st.markdown("#### Top Offers (Above Avg)")
+        st.dataframe(get_top_phrases(above_avg_df['extracted_offer']), use_container_width=True)
     
     with col2:
-        st.markdown("### Below Average")
-        st.caption(f"Low performers (<= avg {metric})")
-        if not below_avg_df.empty:
-            top_prices_below = Counter(below_avg_df['extracted_price'].dropna()).most_common(5)
-            if top_prices_below:
-                df_prices_below = pd.DataFrame(top_prices_below, columns=["Price Callout", "Count"])
-                st.dataframe(df_prices_below, use_container_width=True, hide_index=True)
-            else:
-                st.info("No prices extracted in this group.")
+        st.markdown("#### Top Prices (Below Avg)")
+        st.dataframe(get_top_phrases(below_avg_df['extracted_price']), use_container_width=True)
+        st.markdown("#### Top Offers (Below Avg)")
+        st.dataframe(get_top_phrases(below_avg_df['extracted_offer']), use_container_width=True)
 
-def display_full_data(df_sorted, metric, image_name_col):
-    st.markdown("--- \n ## 1. Detailed Data (Debug View)")
-    st.markdown("Check the **'Raw Text'** column to see exactly what the AI read.")
-    
-    # Only show columns that actually exist in the dataframe
-    possible_cols = [image_name_col, metric, 'extracted_price', 'extracted_offer', 'callout_type', 'raw_text', 'has_face']
-    display_cols = [c for c in possible_cols if c in df_sorted.columns]
-    
-    st.dataframe(df_sorted[display_cols], use_container_width=True)
 
-# --- 3. MAIN APP ---
+def display_best_vs_worst(df_sorted, metric, images_dict):
+    st.markdown("--- \n ## 3. Case Study: Best Creative vs. Worst Creative")
+    
+    if len(df_sorted) == 0:
+        st.warning("No data to display for best vs. worst.")
+        return
+
+    best = df_sorted.iloc[0]
+    worst = df_sorted.iloc[-1]
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("### 🥇 Best Creative")
+        st.markdown(f"**{best['image_name']}**")
+        st.markdown(f"**{metric}: {best[metric]:.4f}**")
+        if best['image_name'] in images_dict:
+            st.image(images_dict[best['image_name']], use_column_width=True)
+        
+        st.markdown("**Analysis:**")
+        st.write(f"- **Callout Type:** {best.callout_type}")
+        st.write(f"- **Price Found:** {best.extracted_price or 'None'}")
+        st.write(f"- **Offer Found:** {best.extracted_offer or 'None'}")
+        st.write(f"- **Face:** {'Yes' if best.has_face else 'No'}")
+        st.write(f"- **Brightness:** {best.brightness_level}")
+
+    with col2:
+        st.markdown("### 🥉 Worst Creative")
+        st.markdown(f"**{worst['image_name']}**")
+        st.markdown(f"**{metric}: {worst[metric]:.4f}**")
+        if worst['image_name'] in images_dict:
+            st.image(images_dict[worst['image_name']], use_column_width=True)
+            
+        st.markdown("**Analysis:**")
+        st.write(f"- **Callout Type:** {worst.callout_type}")
+        st.write(f"- **Price Found:** {worst.extracted_price or 'None'}")
+        st.write(f"- **Offer Found:** {worst.extracted_offer or 'None'}")
+        st.write(f"- **Face:** {'Yes' if worst.has_face else 'No'}")
+        st.write(f"- **Brightness:** {worst.brightness_level}")
+
+# ==========================================
+# 3. MAIN APPLICATION UI
+# ==========================================
 
 st.set_page_config(layout="wide")
 st.title("Creative Analysis Dashboard")
+st.write("Upload your metrics and image folder to get an automated performance analysis. This runs 100% on Python.")
 
+# --- Sidebar ---
 st.sidebar.header("1. Upload Files")
-csv_file = st.sidebar.file_uploader("Upload Metrics CSV", type="csv")
-uploaded_images = st.sidebar.file_uploader("Upload Creative Images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+csv_file = st.sidebar.file_uploader("Upload your Metrics CSV", type="csv")
+uploaded_images = st.sidebar.file_uploader("Upload all your Creative Images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
 st.sidebar.header("2. Configure Columns")
-metric_col = st.sidebar.text_input("Metric Column (e.g. CTR)", "CTR")
-image_name_col = st.sidebar.text_input("Image Name Column", "image_name")
+metric_col = st.sidebar.text_input("Metric to Analyze (from CSV)", "CTR")
+image_name_col = st.sidebar.text_input("Image Filename Column (from CSV)", "image_name")
 
 if st.sidebar.button("Run Analysis", use_container_width=True):
-    if csv_file and uploaded_images:
-        with st.spinner("Loading AI Models..."):
+    if csv_file is not None and len(uploaded_images) > 0:
+        
+        with st.spinner("Initializing models... (This happens once)"):
             face_cascade, ocr_reader = load_models()
-            if not face_cascade: st.stop()
+        
+        if face_cascade is None or ocr_reader is None:
+            st.stop() 
 
-        # Read CSV
-        try:
-            df = pd.read_csv(csv_file)
-            # Validate columns
-            if metric_col not in df.columns or image_name_col not in df.columns:
-                st.error(f"Columns not found! CSV has: {list(df.columns)}")
+        with st.spinner("Parsing CSV..."):
+            try:
+                df = pd.read_csv(csv_file)
+            except Exception as e:
+                st.error(f"Error parsing CSV: {e}")
                 st.stop()
-        except Exception as e:
-            st.error(f"CSV Error: {e}")
+        
+        # Column validation
+        if image_name_col not in df.columns:
+            st.error(f"Error: Image column '{image_name_col}' not found in CSV.")
+            st.stop()
+        if metric_col not in df.columns:
+            st.error(f"Error: Metric column '{metric_col}' not found in CSV.")
             st.stop()
 
-        # Map images
         images_dict = {f.name: f.getvalue() for f in uploaded_images}
         
-        # Run Loop
         all_features = []
-        bar = st.progress(0, text="Analyzing...")
-        total_rows = len(df)
+        progress_bar = st.progress(0, text="Analyzing creatives...")
+        total_images = len(df)
         
-        for i, row in df.iterrows():
-            img_name = row[image_name_col]
-            if img_name in images_dict:
-                feats = analyze_image_features(images_dict[img_name], face_cascade, ocr_reader)
-                if "error" not in feats:
-                    # Merge CSV row + AI features
-                    all_features.append({**row.to_dict(), **feats})
+        for index, row in df.iterrows():
+            image_name = row[image_name_col]
             
-            # Update progress bar
-            bar.progress((i + 1) / total_rows)
+            if image_name in images_dict:
+                image_bytes = images_dict[image_name]
+                features = analyze_image_features(image_bytes, face_cascade, ocr_reader)
+                
+                if "error" not in features:
+                    combined_data = {**row, **features}
+                    all_features.append(combined_data)
+            else:
+                print(f"Skipping row {index}: Image '{image_name}' not found in uploaded files.") 
             
-        bar.empty()
-        
-        if not all_features:
-            st.error("No matching images analyzed. Check your CSV filenames match your image uploads.")
-            st.stop()
+            progress_bar.progress((index + 1) / total_images, text=f"Analyzing {image_name}...")
 
-        # Build DataFrame
-        res_df = pd.DataFrame(all_features)
-        
-        # Convert metric to numeric, forcing errors to NaN
-        res_df[metric_col] = pd.to_numeric(res_df[metric_col], errors='coerce')
-        res_df = res_df.sort_values(by=metric_col, ascending=False)
-        
-        # Display Results
-        display_full_data(res_df, metric_col, image_name_col)
-        
-        mean_val = res_df[metric_col].mean()
-        st.markdown(f"*(Average {metric_col}: {mean_val:.4f})*")
-        
-        display_aggregate_report(
-            res_df[res_df[metric_col] > mean_val], 
-            res_df[res_df[metric_col] <= mean_val], 
-            metric_col
-        )
+        progress_bar.empty()
+
+        if not all_features:
+            st.error("Analysis failed. No matching images found between the CSV and the uploaded files.")
+        else:
+            # --- Create the Full DataFrame ---
+            df_with_features = pd.DataFrame(all_features)
+            
+            try:
+                df_with_features[metric_col] = pd.to_numeric(df_with_features[metric_col])
+            except ValueError:
+                st.error(f"Error: The metric column '{metric_col}' contains non-numeric values.")
+                st.stop()
+            
+            df_sorted = df_with_features.sort_values(by=metric_col, ascending=False)
+            
+            # --- Display Reports ---
+            st.markdown("## 1. Complete Analysis Data Table")
+            
+            # Columns to show in the main table
+            display_cols = [image_name_col, metric_col, 'callout_type', 'extracted_price', 'extracted_offer', 'has_face', 'brightness_level']
+            # Ensure columns exist (in case no offers were found in the entire batch)
+            valid_cols = [c for c in display_cols if c in df_sorted.columns]
+            
+            st.dataframe(df_sorted[valid_cols])
+
+            # Groups for aggregate analysis
+            mean_metric = df_sorted[metric_col].mean()
+            st.markdown(f"*(The average **{metric_col}** is **{mean_metric:.4f}**)*")
+            
+            above_avg_df = df_sorted[df_sorted[metric_col] > mean_metric]
+            below_avg_df = df_sorted[df_sorted[metric_col] <= mean_metric]
+
+            if above_avg_df.empty or below_avg_df.empty:
+                st.warning("Cannot perform aggregate analysis: all creatives are on one side of the average.")
+            else:
+                display_aggregate_report(above_avg_df, below_avg_df, metric_col)
+                
+                best_worst_images = {}
+                if not df_sorted.empty:
+                    best_name = df_sorted.iloc[0]['image_name']
+                    worst_name = df_sorted.iloc[-1]['image_name']
+                    if best_name in images_dict:
+                        best_worst_images[best_name] = images_dict[best_name]
+                    if worst_name in images_dict:
+                        best_worst_images[worst_name] = images_dict[worst_name]
+                
+                display_best_vs_worst(df_sorted, metric_col, best_worst_images)
     else:
-        st.warning("Please upload both CSV and Images.")
+        st.warning("Please upload a CSV file and at least one image.")
