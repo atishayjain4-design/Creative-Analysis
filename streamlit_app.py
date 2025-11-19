@@ -137,9 +137,7 @@ def display_aggregate_report(above_avg_df, below_avg_df, metric):
     with col1:
         st.markdown("**Above Average**")
         if not above_avg_df.empty:
-            # Convert boolean to string for clearer chart
             face_counts = above_avg_df['has_face'].astype(str).value_counts(normalize=True)
-            # Ensure both True and False are present for consistent colors
             face_counts = face_counts.reindex(['True', 'False']).fillna(0)
             st.bar_chart(face_counts)
     with col2:
@@ -307,5 +305,19 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             res_df[res_df[metric_col] <= mean_val], 
             metric_col
         )
+        
+        # --- THIS IS THE PART THAT WAS MISSING ---
+        best_worst_images = {}
+        if not res_df.empty:
+            best_name = res_df.iloc[0][image_name_col]
+            worst_name = res_df.iloc[-1][image_name_col]
+            if best_name in images_dict:
+                best_worst_images[best_name] = images_dict[best_name]
+            if worst_name in images_dict:
+                best_worst_images[worst_name] = images_dict[worst_name]
+        
+        display_best_vs_worst(res_df, metric_col, best_worst_images)
+        # ----------------------------------------
+        
     else:
         st.warning("Please upload both CSV and Images.")
