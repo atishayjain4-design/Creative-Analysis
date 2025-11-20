@@ -16,94 +16,123 @@ def load_models():
     """Loads OpenCV and EasyOCR models into memory."""
     print("Loading models...")
     
-    # --- UPDATED: Using 'alt2' model which is much better at avoiding false positives ---
+    # Use 'alt2' model for better face detection
     cascade_filename = 'haarcascade_frontalface_alt2.xml'
     cascade_url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_alt2.xml"
     
-    # Check if model exists, if not, DOWNLOAD it automatically
     if not os.path.exists(cascade_filename):
         print(f"Model not found. Downloading {cascade_filename}...")
         try:
             urllib.request.urlretrieve(cascade_url, cascade_filename)
-            print("Download complete.")
         except Exception as e:
-            st.error(f"Fatal Error: Could not download face detection model. Check internet connection. Error: {e}")
+            st.error(f"Fatal Error: Could not download face model. {e}")
             return None, None
             
-    # Load the classifier
     face_cascade = cv2.CascadeClassifier(cascade_filename)
     if face_cascade.empty():
-        st.error("Fatal Error: Loaded XML file is empty or corrupted.")
+        st.error("Fatal Error: Loaded XML file is empty.")
         return None, None
     
-    # 2. Setup OCR Model
-    print("Loading EasyOCR model (this may take a moment)...")
+    print("Loading EasyOCR...")
     ocr_reader = easyocr.Reader(['en'], gpu=False)
-    print("Models loaded successfully.")
-    
+    print("Models loaded.")
     return face_cascade, ocr_reader
 
 def analyze_image_features(image_bytes, face_cascade, ocr_reader):
-    """
-    Analyzes a single image (as bytes) and returns a dictionary of its features.
-    """
     try:
-        # Convert bytes to OpenCV image
         file_bytes = np.asarray(bytearray(image_bytes), dtype=np.uint8)
         image_cv = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-        if image_cv is None:
-            return {"error": "Could not decode image"}
+        if image_cv is None: return {"error": "Decode failed"}
 
-        # --- CV Features ---
+        height, width, _ = image_cv.shape
+        total_area = width * height
+
+        # --- 1. CV Features ---
         gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
         
-        # --- UPDATED FACE DETECTION PARAMETERS ---
-        # scaleFactor=1.1: Checks image at different sizes (standard)
-        # minNeighbors=5:  Stricter threshold. Requires 5 detections in one spot to count as a face.
-        #                  (Previous was 4. Increasing this eliminates random noise/false positives).
-        # minSize=(50, 50): Ignores very small blurry patches that often look like faces.
-        faces = face_cascade.detectMultiScale(
-            gray, 
-            scaleFactor=1.1, 
-            minNeighbors=5, 
-            minSize=(50, 50)
-        )
+        # Face Detection
+        faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(50, 50))
         has_face = len(faces) > 0
         
-        # Calculate Brightness
+        # Brightness
         brightness = np.mean(gray)
         if brightness < 90: brightness_level = "Low (Dark)"
         elif brightness < 180: brightness_level = "Medium (Balanced)"
         else: brightness_level = "High (Bright)"
 
-        # --- OCR Features ---
-        results = ocr_reader.readtext(image_bytes, detail=0, paragraph=True)
-        raw_text = " ".join(results)
-        
-        # Basic Cleaning
-        cleaned_text = raw_text.upper()
-        has_text = len(cleaned_text.strip()) > 5
-        
-        # --- ULTRA-ROBUST PRICE EXTRACTION LOGIC ---
-        
-        # 1. Permissive Hook Regex
-        hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+(?:/-)?)")
+        # --- 2. 2D vs 3D / Depth Analysis ---
+        # We use the standard deviation of pixel intensities as a proxy for "texture"
+        # High std dev = lots of variation (shadows, texture, photos) = 3D/Depth
+        # Low std dev = flat colors, uniform areas = 2D/Flat
+        texture_score = np.std(gray)
+        if texture_score < 40:
+            visual_style = "2D / Flat"
+        elif texture_score < 60:
+            visual_style = "Mixed"
+        else:
+            visual_style = "3D / Photo / Depth"
 
-        # 2. Loose Price Regex
+        # --- 3. Product Image Size Estimation ---
+        # We try to find the largest object that isn't the whole image frame
+        # Blur to remove noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        # Canny edge detection
+        edges = cv2.Canny(blurred, 50, 150)
+        # Find contours
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        product_area_pct = 0.0
+        if contours:
+            # Sort contours by area
+            contours = sorted(contours, key=cv2.contourArea, reverse=True)
+            
+            # Take the largest contour that isn't the *entire* image (frame)
+            for c in contours:
+                area = cv2.contourArea(c)
+                # Ignore if it covers > 95% (likely a border) or < 5% (noise)
+                if 0.05 * total_area < area < 0.95 * total_area:
+                    product_area_pct = (area / total_area) * 100
+                    break
+        
+        # Format the size
+        if product_area_pct < 15: product_size_label = "Small (<15%)"
+        elif product_area_pct < 40: product_size_label = "Medium (15-40%)"
+        else: product_size_label = "Large (>40%)"
+
+
+        # --- 4. Advanced OCR (Text & Layout) ---
+        # detail=1 gives us bounding box coordinates: [[x,y], [x,y], [x,y], [x,y]]
+        ocr_results = ocr_reader.readtext(image_bytes, detail=1, paragraph=False)
+        
+        all_text_parts = []
+        max_font_height = 0
+        headline_text = "None"
+        
+        for (bbox, text, prob) in ocr_results:
+            all_text_parts.append(text)
+            
+            # Calculate font height (y_bottom - y_top)
+            # bbox is [[tl], [tr], [br], [bl]]
+            box_height = bbox[2][1] - bbox[0][1]
+            
+            if box_height > max_font_height:
+                max_font_height = box_height
+                headline_text = text
+
+        raw_text = " ".join(all_text_parts)
+        cleaned_text = raw_text.upper()
+
+        # --- Price Extraction ---
+        hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+(?:/-)?)")
         loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+(?:/-)?)")
-        
-        # 3. Suffix Price Regex
         suffix_price_regex = re.compile(r"([\d,.]+/-)")
-        
-        # 4. Offer Regex
         offer_regex = re.compile(r"(\d{1,2}\s?% (?:OFF)?|SALE|FREE SHIPPING|FREE|BOGO|DEAL|OFFER|FLAT \d+%)")
         
         callout_type = "None"
         extracted_price = None
         extracted_offer = None
 
-        # Attempt matches in order of specificity
         hook_match = hook_price_regex.search(cleaned_text)
         loose_match = loose_price_regex.search(cleaned_text)
         suffix_match = suffix_price_regex.search(cleaned_text)
@@ -120,20 +149,19 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             extracted_price = suffix_match.group(1)
         
         if offer_match:
-            if "Price" in callout_type:
-                callout_type = "Price + Offer"
-            else:
-                callout_type = "Offer"
+            if "Price" in callout_type: callout_type = "Price + Offer"
+            else: callout_type = "Offer"
             extracted_offer = offer_match.group(1)
 
-        # --- CLEAN UP: Fix common OCR errors ---
         if extracted_price:
             extracted_price = extracted_price.replace("?", "₹").replace("~", "₹")
             extracted_price = re.sub(r"([A-Z])(₹)", r"\1 \2", extracted_price)
 
         return {
             "has_face": has_face,
-            "face_count": len(faces),
+            "visual_style": visual_style,         # NEW: 2D vs 3D
+            "product_size_label": product_size_label, # NEW: Small/Med/Large
+            "headline_text": headline_text,       # NEW: Text with largest font
             "brightness_level": brightness_level,
             "callout_type": callout_type,
             "extracted_price": extracted_price, 
@@ -141,137 +169,110 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             "raw_text": raw_text
         }
     except Exception as e:
-        print(f"Error analyzing image: {e}") 
+        print(f"Error: {e}") 
         return {"error": str(e)}
 
-# --- 2. REPORTING FUNCTIONS ---
+# --- 2. REPORTING UI ---
 
 def display_full_data(df_sorted, metric, image_name_col):
-    """Displays the detailed data table for debugging."""
-    st.markdown("--- \n ## 1. Detailed Data (Debug View)")
-    st.markdown("Check the columns to see what the AI extracted.")
+    st.markdown("--- \n ## 1. Detailed Data")
     
-    cols = [image_name_col, metric, 'has_face', 'extracted_price', 'extracted_offer', 'callout_type', 'raw_text']
+    cols = [
+        image_name_col, metric, 
+        'visual_style', 'product_size_label', 
+        'headline_text', 'extracted_price', 'extracted_offer', 
+        'has_face'
+    ]
     cols = [c for c in cols if c in df_sorted.columns]
     
     st.dataframe(df_sorted[cols], use_container_width=True)
 
 def display_aggregate_report(above_avg_df, below_avg_df, metric):
-    st.markdown("--- \n ## 2. Aggregate Analysis: High-Performers vs. Low-Performers")
-    st.markdown(f"Comparing **{len(above_avg_df)}** high-performing creatives against **{len(below_avg_df)}** low-performing ones.")
+    st.markdown("--- \n ## 2. Aggregate Analysis")
+    st.markdown(f"Comparing **{len(above_avg_df)}** Top Performers vs. **{len(below_avg_df)}** Low Performers.")
 
-    # --- 1. Face Detection Distribution ---
+    # --- Visual Style & Size ---
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### Visual Style (2D vs 3D)")
+        st.caption("Is the creative flat/graphical or photographic/depth?")
+        if not above_avg_df.empty:
+            st.markdown("**Above Average:**")
+            st.bar_chart(above_avg_df['visual_style'].value_counts(normalize=True))
+    with col2:
+        st.markdown("### Product Image Size")
+        st.caption("How large is the main object?")
+        if not above_avg_df.empty:
+            st.markdown("**Above Average:**")
+            st.bar_chart(above_avg_df['product_size_label'].value_counts(normalize=True))
+
+    st.divider()
+
+    # --- Face Detection ---
     st.markdown("### Human Element (Has Face?)")
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("**Above Average**")
         if not above_avg_df.empty:
             face_counts = above_avg_df['has_face'].astype(str).value_counts(normalize=True)
-            face_counts = face_counts.reindex(['True', 'False']).fillna(0)
-            st.bar_chart(face_counts)
+            st.bar_chart(face_counts.reindex(['True', 'False']).fillna(0))
     with col2:
-        st.markdown("**Below Average**")
         if not below_avg_df.empty:
             face_counts_below = below_avg_df['has_face'].astype(str).value_counts(normalize=True)
-            face_counts_below = face_counts_below.reindex(['True', 'False']).fillna(0)
-            st.bar_chart(face_counts_below)
-
-    # --- 2. Brightness Level Distribution ---
-    st.markdown("### Brightness Level Distribution")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("Above Average")
-        if not above_avg_df.empty:
-            st.bar_chart(above_avg_df['brightness_level'].value_counts(normalize=True))
-    with col2:
-        st.markdown("Below Average")
-        if not below_avg_df.empty:
-            st.bar_chart(below_avg_df['brightness_level'].value_counts(normalize=True))
+            st.bar_chart(face_counts_below.reindex(['True', 'False']).fillna(0))
     
-    # --- 3. Callout Type Distribution ---
-    st.markdown("### Callout Type Distribution")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("Above Average")
-        if not above_avg_df.empty:
-            callout_counts_above = above_avg_df['callout_type'].value_counts(normalize=True)
-            st.bar_chart(callout_counts_above.reindex(["Price + Offer", "Price Hook", "Price Only", "Offer", "None"]).fillna(0))
-    with col2:
-        st.markdown("Below Average")
-        if not below_avg_df.empty:
-            callout_counts_below = below_avg_df['callout_type'].value_counts(normalize=True)
-            st.bar_chart(callout_counts_below.reindex(["Price + Offer", "Price Hook", "Price Only", "Offer", "None"]).fillna(0))
-    
-    # --- 4. Top Extracted Callouts ---
-    st.markdown("### Top Callouts (The \"Why\")")
-    st.markdown("These tables show exactly which prices and offers appeared most often.")
+    # --- Top Callouts ---
+    st.markdown("### Top Callouts")
     
     def get_top_phrases(series):
         counts = Counter(series.dropna()).most_common(5)
-        if not counts:
-            return pd.DataFrame(columns=["Phrase", "Count"])
-        return pd.DataFrame(counts, columns=["Phrase", "Count"])
+        return pd.DataFrame(counts, columns=["Phrase", "Count"]) if counts else None
 
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("#### Top Prices (Above Avg)")
-        st.dataframe(get_top_phrases(above_avg_df['extracted_price']), use_container_width=True, hide_index=True)
-        st.markdown("#### Top Offers (Above Avg)")
-        st.dataframe(get_top_phrases(above_avg_df['extracted_offer']), use_container_width=True, hide_index=True)
-    
+        st.markdown("**Top Prices (Above Avg)**")
+        df_p = get_top_phrases(above_avg_df['extracted_price'])
+        if df_p is not None: st.dataframe(df_p, use_container_width=True, hide_index=True)
+        
     with col2:
-        st.markdown("#### Top Prices (Below Avg)")
-        st.dataframe(get_top_phrases(below_avg_df['extracted_price']), use_container_width=True, hide_index=True)
-        st.markdown("#### Top Offers (Below Avg)")
-        st.dataframe(get_top_phrases(below_avg_df['extracted_offer']), use_container_width=True, hide_index=True)
+        st.markdown("**Top Offers (Above Avg)**")
+        df_o = get_top_phrases(above_avg_df['extracted_offer'])
+        if df_o is not None: st.dataframe(df_o, use_container_width=True, hide_index=True)
 
 
 def display_best_vs_worst(df_sorted, metric, images_dict):
-    st.markdown("--- \n ## 3. Case Study: Best Creative vs. Worst Creative")
+    st.markdown("--- \n ## 3. Best vs. Worst")
     
-    if len(df_sorted) == 0:
-        st.warning("No data to display for best vs. worst.")
-        return
+    if len(df_sorted) == 0: return
 
     best = df_sorted.iloc[0]
     worst = df_sorted.iloc[-1]
     
     col1, col2 = st.columns(2)
     
-    with col1:
-        st.markdown("### 🥇 Best Creative")
-        st.markdown(f"**{best['image_name']}**")
-        st.markdown(f"**{metric}: {best[metric]:.4f}**")
-        if best['image_name'] in images_dict:
-            st.image(images_dict[best['image_name']], use_column_width=True)
-        
-        st.write(f"**Face Detected:** {'✅ Yes' if best.has_face else '❌ No'}")
-        st.write(f"**Extracted Price:** {best.extracted_price or 'N/A'}")
-        st.write(f"**Extracted Offer:** {best.extracted_offer or 'N/A'}")
-        st.write(f"**Callout Type:** {best.callout_type}")
-        st.write(f"**Brightness:** {best.brightness_level}")
+    for col, item, title in [(col1, best, "🥇 Best"), (col2, worst, "🥉 Worst")]:
+        with col:
+            st.markdown(f"### {title}")
+            st.markdown(f"**{item['image_name']}**")
+            st.markdown(f"**{metric}: {item[metric]:.4f}**")
+            
+            if item['image_name'] in images_dict:
+                st.image(images_dict[item['image_name']], use_column_width=True)
+            
+            st.success(f"**Headline:** {item['headline_text']}")
+            st.info(f"**Style:** {item['visual_style']}")
+            st.write(f"**Product Size:** {item['product_size_label']}")
+            st.write(f"**Face:** {'Yes' if item.has_face else 'No'}")
+            st.write(f"**Price:** {item.extracted_price or '-'}")
+            st.write(f"**Offer:** {item.extracted_offer or '-'}")
 
-    with col2:
-        st.markdown("### 🥉 Worst Creative")
-        st.markdown(f"**{worst['image_name']}**")
-        st.markdown(f"**{metric}: {worst[metric]:.4f}**")
-        if worst['image_name'] in images_dict:
-            st.image(images_dict[worst['image_name']], use_column_width=True)
-        
-        st.write(f"**Face Detected:** {'✅ Yes' if worst.has_face else '❌ No'}")
-        st.write(f"**Extracted Price:** {worst.extracted_price or 'N/A'}")
-        st.write(f"**Extracted Offer:** {worst.extracted_offer or 'N/A'}")
-        st.write(f"**Callout Type:** {worst.callout_type}")
-        st.write(f"**Brightness:** {worst.brightness_level}")
-
-# --- 3. MAIN APPLICATION UI ---
+# --- 3. MAIN APP ---
 
 st.set_page_config(layout="wide")
 st.title("Creative Analysis Dashboard")
 
 st.sidebar.header("1. Upload Files")
 csv_file = st.sidebar.file_uploader("Upload Metrics CSV", type="csv")
-uploaded_images = st.sidebar.file_uploader("Upload all your Creative Images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+uploaded_images = st.sidebar.file_uploader("Upload Creative Images", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True)
 
 st.sidebar.header("2. Configure Columns")
 metric_col = st.sidebar.text_input("Metric Column (e.g. CTR)", "CTR")
@@ -285,7 +286,6 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
 
         try:
             df = pd.read_csv(csv_file)
-            # Validate columns
             if metric_col not in df.columns or image_name_col not in df.columns:
                 st.error(f"Columns not found! CSV has: {list(df.columns)}")
                 st.stop()
@@ -304,26 +304,18 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             if img_name in images_dict:
                 feats = analyze_image_features(images_dict[img_name], face_cascade, ocr_reader)
                 if "error" not in feats:
-                    # Merge CSV row + AI features
                     all_features.append({**row.to_dict(), **feats})
-            
-            # Update progress bar
             bar.progress((i + 1) / total_rows)
-            
         bar.empty()
         
         if not all_features:
-            st.error("No matching images analyzed. Check your CSV filenames match your image uploads.")
+            st.error("No matching images analyzed.")
             st.stop()
 
-        # Build DataFrame
         res_df = pd.DataFrame(all_features)
-        
-        # Convert metric to numeric, forcing errors to NaN
         res_df[metric_col] = pd.to_numeric(res_df[metric_col], errors='coerce')
         res_df = res_df.sort_values(by=metric_col, ascending=False)
         
-        # Display Results
         display_full_data(res_df, metric_col, image_name_col)
         
         mean_val = res_df[metric_col].mean()
@@ -345,6 +337,5 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
                 best_worst_images[worst_name] = images_dict[worst_name]
         
         display_best_vs_worst(res_df, metric_col, best_worst_images)
-        
     else:
         st.warning("Please upload both CSV and Images.")
