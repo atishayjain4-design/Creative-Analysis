@@ -5,6 +5,7 @@ import numpy as np
 import re
 import os
 import easyocr
+import urllib.request
 from io import BytesIO
 from collections import Counter
 
@@ -14,19 +15,32 @@ from collections import Counter
 def load_models():
     """Loads OpenCV and EasyOCR models into memory."""
     print("Loading models...")
-    cascade_path = 'haarcascade_frontalface_default.xml'
     
-    if not os.path.exists(cascade_path):
-        st.error(f"Fatal Error: `{cascade_path}` not found.")
-        st.error("Please download this file and upload it to your GitHub repository:")
-        st.code("https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml")
+    # --- UPDATED: Using 'alt2' model which is much better at avoiding false positives ---
+    cascade_filename = 'haarcascade_frontalface_alt2.xml'
+    cascade_url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_alt2.xml"
+    
+    # Check if model exists, if not, DOWNLOAD it automatically
+    if not os.path.exists(cascade_filename):
+        print(f"Model not found. Downloading {cascade_filename}...")
+        try:
+            urllib.request.urlretrieve(cascade_url, cascade_filename)
+            print("Download complete.")
+        except Exception as e:
+            st.error(f"Fatal Error: Could not download face detection model. Check internet connection. Error: {e}")
+            return None, None
+            
+    # Load the classifier
+    face_cascade = cv2.CascadeClassifier(cascade_filename)
+    if face_cascade.empty():
+        st.error("Fatal Error: Loaded XML file is empty or corrupted.")
         return None, None
-        
-    face_cascade = cv2.CascadeClassifier(cascade_path)
     
+    # 2. Setup OCR Model
     print("Loading EasyOCR model (this may take a moment)...")
     ocr_reader = easyocr.Reader(['en'], gpu=False)
     print("Models loaded successfully.")
+    
     return face_cascade, ocr_reader
 
 def analyze_image_features(image_bytes, face_cascade, ocr_reader):
@@ -38,11 +52,26 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         file_bytes = np.asarray(bytearray(image_bytes), dtype=np.uint8)
         image_cv = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
+        if image_cv is None:
+            return {"error": "Could not decode image"}
+
         # --- CV Features ---
         gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.1, 5)
+        
+        # --- UPDATED FACE DETECTION PARAMETERS ---
+        # scaleFactor=1.1: Checks image at different sizes (standard)
+        # minNeighbors=5:  Stricter threshold. Requires 5 detections in one spot to count as a face.
+        #                  (Previous was 4. Increasing this eliminates random noise/false positives).
+        # minSize=(50, 50): Ignores very small blurry patches that often look like faces.
+        faces = face_cascade.detectMultiScale(
+            gray, 
+            scaleFactor=1.1, 
+            minNeighbors=5, 
+            minSize=(50, 50)
+        )
         has_face = len(faces) > 0
         
+        # Calculate Brightness
         brightness = np.mean(gray)
         if brightness < 90: brightness_level = "Low (Dark)"
         elif brightness < 180: brightness_level = "Medium (Balanced)"
@@ -104,6 +133,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
         return {
             "has_face": has_face,
+            "face_count": len(faces),
             "brightness_level": brightness_level,
             "callout_type": callout_type,
             "extracted_price": extracted_price, 
@@ -119,9 +149,8 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 def display_full_data(df_sorted, metric, image_name_col):
     """Displays the detailed data table for debugging."""
     st.markdown("--- \n ## 1. Detailed Data (Debug View)")
-    st.markdown("Check the **'Raw Text'** column to see exactly what the AI read.")
+    st.markdown("Check the columns to see what the AI extracted.")
     
-    # Ensure columns exist before selecting
     cols = [image_name_col, metric, 'has_face', 'extracted_price', 'extracted_offer', 'callout_type', 'raw_text']
     cols = [c for c in cols if c in df_sorted.columns]
     
@@ -306,7 +335,6 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             metric_col
         )
         
-        # --- THIS IS THE PART THAT WAS MISSING ---
         best_worst_images = {}
         if not res_df.empty:
             best_name = res_df.iloc[0][image_name_col]
@@ -317,7 +345,6 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
                 best_worst_images[worst_name] = images_dict[worst_name]
         
         display_best_vs_worst(res_df, metric_col, best_worst_images)
-        # ----------------------------------------
         
     else:
         st.warning("Please upload both CSV and Images.")
