@@ -77,29 +77,40 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             contours = sorted(contours, key=cv2.contourArea, reverse=True)
             for c in contours:
                 area = cv2.contourArea(c)
+                # Heuristic: Ignore if it covers > 95% (border) or < 5% (noise)
                 if 0.05 * total_area < area < 0.95 * total_area:
                     product_area_pct = (area / total_area) * 100
                     break
         
-        if product_area_pct < 15: product_size_label = "Small (<15%)"
-        elif product_area_pct < 40: product_size_label = "Medium (15-40%)"
-        else: product_size_label = "Large (>40%)"
+        # Generate labels for charting, but keep the exact float for the table
+        if product_area_pct < 15: product_size_bucket = "Small (<15%)"
+        elif product_area_pct < 40: product_size_bucket = "Medium (15-40%)"
+        else: product_size_bucket = "Large (>40%)"
 
         # --- OCR Features (Advanced) ---
-        # We use detail=1 to get bounding boxes for font size calculation
         ocr_results = ocr_reader.readtext(image_bytes, detail=1, paragraph=False)
         
         all_text_parts = []
         max_font_height = 0
-        headline_text = "None"
+        max_text_length = 0
+        
+        headline_text = "None" # Largest Font
+        main_body_text = "None" # Longest Text Block
         
         for (bbox, text, prob) in ocr_results:
             all_text_parts.append(text)
-            # Calculate box height (bottom_y - top_y)
+            
+            # 1. Find Headline (Largest Font)
             box_height = bbox[2][1] - bbox[0][1]
             if box_height > max_font_height:
                 max_font_height = box_height
                 headline_text = text
+            
+            # 2. Find Main Text (Longest String)
+            # We ignore single characters or super short words for "Main Text"
+            if len(text) > max_text_length and len(text) > 3:
+                max_text_length = len(text)
+                main_body_text = text
 
         raw_text = " ".join(all_text_parts)
         cleaned_text = raw_text.upper()
@@ -139,8 +150,10 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             extracted_price = re.sub(r"([A-Z])(₹)", r"\1 \2", extracted_price)
 
         return {
-            "headline_text": headline_text,
-            "product_size_label": product_size_label,
+            "headline_text": headline_text,       # Largest Font
+            "main_body_text": main_body_text,     # Longest Text Block (New Request)
+            "product_area_pct": product_area_pct, # Exact % (New Request)
+            "product_size_bucket": product_size_bucket, # For Aggregate Charting
             "visual_style": visual_style,
             "has_face": has_face,
             "brightness_level": brightness_level,
@@ -160,13 +173,19 @@ def display_full_data(df_sorted, metric, image_name_col):
     
     cols = [
         image_name_col, metric, 
-        'headline_text', 'product_size_label', 
+        'main_body_text', 'headline_text',  # Updated columns
+        'product_area_pct', # Exact %
         'extracted_price', 'extracted_offer', 
         'has_face', 'visual_style'
     ]
     cols = [c for c in cols if c in df_sorted.columns]
     
-    st.dataframe(df_sorted[cols], use_container_width=True)
+    # Format the percentage for display
+    display_df = df_sorted[cols].copy()
+    if 'product_area_pct' in display_df.columns:
+        display_df['product_area_pct'] = display_df['product_area_pct'].apply(lambda x: f"{x:.1f}%")
+
+    st.dataframe(display_df, use_container_width=True)
 
 def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
     st.markdown("--- \n ## 2. Aggregate Analysis")
@@ -181,10 +200,12 @@ def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
             st.bar_chart(above_bench_df['visual_style'].value_counts(normalize=True))
             
     with col2:
-        st.markdown("### Product Image Size")
+        st.markdown("### Product Image Size (Distribution)")
+        st.caption("We group the exact percentages into buckets for this chart.")
         if not above_bench_df.empty:
             st.markdown("**Top Performers:**")
-            st.bar_chart(above_bench_df['product_size_label'].value_counts(normalize=True))
+            # Use the bucket column for the chart
+            st.bar_chart(above_bench_df['product_size_bucket'].value_counts(normalize=True))
 
     # --- Face Detection ---
     st.markdown("### Human Element (Has Face?)")
@@ -238,8 +259,8 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
             if item['image_name'] in images_dict:
                 st.image(images_dict[item['image_name']], use_column_width=True)
             
-            st.success(f"**Headline:** {item.get('headline_text', 'N/A')}")
-            st.info(f"**Product Size:** {item.get('product_size_label', 'N/A')}")
+            st.success(f"**Main Text:** {item.get('main_body_text', 'N/A')}")
+            st.info(f"**Product Coverage:** {item.get('product_area_pct', 0):.1f}%")
             st.write(f"**Face:** {'Yes' if item.has_face else 'No'}")
             st.write(f"**Price:** {item.extracted_price or '-'}")
             st.write(f"**Offer:** {item.extracted_offer or '-'}")
