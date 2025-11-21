@@ -45,13 +45,10 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
         if image_cv is None: return {"error": "Decode failed"}
 
-        height, width, _ = image_cv.shape
-        total_area = width * height
-
-        # --- 1. CV Features ---
+        # --- CV Features ---
         gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
         
-        # Face Detection
+        # Face Detection (Strict settings)
         faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(50, 50))
         has_face = len(faces) > 0
         
@@ -61,68 +58,11 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif brightness < 180: brightness_level = "Medium (Balanced)"
         else: brightness_level = "High (Bright)"
 
-        # --- 2. 2D vs 3D / Depth Analysis ---
-        # We use the standard deviation of pixel intensities as a proxy for "texture"
-        # High std dev = lots of variation (shadows, texture, photos) = 3D/Depth
-        # Low std dev = flat colors, uniform areas = 2D/Flat
-        texture_score = np.std(gray)
-        if texture_score < 40:
-            visual_style = "2D / Flat"
-        elif texture_score < 60:
-            visual_style = "Mixed"
-        else:
-            visual_style = "3D / Photo / Depth"
-
-        # --- 3. Product Image Size Estimation ---
-        # We try to find the largest object that isn't the whole image frame
-        # Blur to remove noise
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        # Canny edge detection
-        edges = cv2.Canny(blurred, 50, 150)
-        # Find contours
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        product_area_pct = 0.0
-        if contours:
-            # Sort contours by area
-            contours = sorted(contours, key=cv2.contourArea, reverse=True)
-            
-            # Take the largest contour that isn't the *entire* image (frame)
-            for c in contours:
-                area = cv2.contourArea(c)
-                # Ignore if it covers > 95% (likely a border) or < 5% (noise)
-                if 0.05 * total_area < area < 0.95 * total_area:
-                    product_area_pct = (area / total_area) * 100
-                    break
-        
-        # Format the size
-        if product_area_pct < 15: product_size_label = "Small (<15%)"
-        elif product_area_pct < 40: product_size_label = "Medium (15-40%)"
-        else: product_size_label = "Large (>40%)"
-
-
-        # --- 4. Advanced OCR (Text & Layout) ---
-        # detail=1 gives us bounding box coordinates: [[x,y], [x,y], [x,y], [x,y]]
-        ocr_results = ocr_reader.readtext(image_bytes, detail=1, paragraph=False)
-        
-        all_text_parts = []
-        max_font_height = 0
-        headline_text = "None"
-        
-        for (bbox, text, prob) in ocr_results:
-            all_text_parts.append(text)
-            
-            # Calculate font height (y_bottom - y_top)
-            # bbox is [[tl], [tr], [br], [bl]]
-            box_height = bbox[2][1] - bbox[0][1]
-            
-            if box_height > max_font_height:
-                max_font_height = box_height
-                headline_text = text
-
-        raw_text = " ".join(all_text_parts)
+        # --- OCR Features ---
+        results = ocr_reader.readtext(image_bytes, detail=0, paragraph=True)
+        raw_text = " ".join(results)
         cleaned_text = raw_text.upper()
-
+        
         # --- Price Extraction ---
         hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+(?:/-)?)")
         loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+(?:/-)?)")
@@ -159,9 +99,6 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
         return {
             "has_face": has_face,
-            "visual_style": visual_style,         # NEW: 2D vs 3D
-            "product_size_label": product_size_label, # NEW: Small/Med/Large
-            "headline_text": headline_text,       # NEW: Text with largest font
             "brightness_level": brightness_level,
             "callout_type": callout_type,
             "extracted_price": extracted_price, 
@@ -177,47 +114,27 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 def display_full_data(df_sorted, metric, image_name_col):
     st.markdown("--- \n ## 1. Detailed Data")
     
-    cols = [
-        image_name_col, metric, 
-        'visual_style', 'product_size_label', 
-        'headline_text', 'extracted_price', 'extracted_offer', 
-        'has_face'
-    ]
+    cols = [image_name_col, metric, 'has_face', 'extracted_price', 'extracted_offer', 'callout_type']
     cols = [c for c in cols if c in df_sorted.columns]
     
     st.dataframe(df_sorted[cols], use_container_width=True)
 
-def display_aggregate_report(above_avg_df, below_avg_df, metric):
+def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
     st.markdown("--- \n ## 2. Aggregate Analysis")
-    st.markdown(f"Comparing **{len(above_avg_df)}** Top Performers vs. **{len(below_avg_df)}** Low Performers.")
-
-    # --- Visual Style & Size ---
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("### Visual Style (2D vs 3D)")
-        st.caption("Is the creative flat/graphical or photographic/depth?")
-        if not above_avg_df.empty:
-            st.markdown("**Above Average:**")
-            st.bar_chart(above_avg_df['visual_style'].value_counts(normalize=True))
-    with col2:
-        st.markdown("### Product Image Size")
-        st.caption("How large is the main object?")
-        if not above_avg_df.empty:
-            st.markdown("**Above Average:**")
-            st.bar_chart(above_avg_df['product_size_label'].value_counts(normalize=True))
-
-    st.divider()
+    st.markdown(f"Comparing **{len(above_bench_df)}** Top Performers (> {benchmark}) vs. **{len(below_bench_df)}** Low Performers (<= {benchmark}).")
 
     # --- Face Detection ---
     st.markdown("### Human Element (Has Face?)")
     col1, col2 = st.columns(2)
     with col1:
-        if not above_avg_df.empty:
-            face_counts = above_avg_df['has_face'].astype(str).value_counts(normalize=True)
+        if not above_bench_df.empty:
+            st.markdown(f"**Above {benchmark}**")
+            face_counts = above_bench_df['has_face'].astype(str).value_counts(normalize=True)
             st.bar_chart(face_counts.reindex(['True', 'False']).fillna(0))
     with col2:
-        if not below_avg_df.empty:
-            face_counts_below = below_avg_df['has_face'].astype(str).value_counts(normalize=True)
+        if not below_bench_df.empty:
+            st.markdown(f"**Below {benchmark}**")
+            face_counts_below = below_bench_df['has_face'].astype(str).value_counts(normalize=True)
             st.bar_chart(face_counts_below.reindex(['True', 'False']).fillna(0))
     
     # --- Top Callouts ---
@@ -229,18 +146,18 @@ def display_aggregate_report(above_avg_df, below_avg_df, metric):
 
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("**Top Prices (Above Avg)**")
-        df_p = get_top_phrases(above_avg_df['extracted_price'])
+        st.markdown(f"**Top Prices (> {benchmark})**")
+        df_p = get_top_phrases(above_bench_df['extracted_price'])
         if df_p is not None: st.dataframe(df_p, use_container_width=True, hide_index=True)
         
     with col2:
-        st.markdown("**Top Offers (Above Avg)**")
-        df_o = get_top_phrases(above_avg_df['extracted_offer'])
+        st.markdown(f"**Top Offers (> {benchmark})**")
+        df_o = get_top_phrases(above_bench_df['extracted_offer'])
         if df_o is not None: st.dataframe(df_o, use_container_width=True, hide_index=True)
 
 
 def display_best_vs_worst(df_sorted, metric, images_dict):
-    st.markdown("--- \n ## 3. Best vs. Worst")
+    st.markdown("--- \n ## 3. Best vs. Worst (Overall)")
     
     if len(df_sorted) == 0: return
 
@@ -258,9 +175,6 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
             if item['image_name'] in images_dict:
                 st.image(images_dict[item['image_name']], use_column_width=True)
             
-            st.success(f"**Headline:** {item['headline_text']}")
-            st.info(f"**Style:** {item['visual_style']}")
-            st.write(f"**Product Size:** {item['product_size_label']}")
             st.write(f"**Face:** {'Yes' if item.has_face else 'No'}")
             st.write(f"**Price:** {item.extracted_price or '-'}")
             st.write(f"**Offer:** {item.extracted_offer or '-'}")
@@ -274,9 +188,11 @@ st.sidebar.header("1. Upload Files")
 csv_file = st.sidebar.file_uploader("Upload Metrics CSV", type="csv")
 uploaded_images = st.sidebar.file_uploader("Upload Creative Images", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True)
 
-st.sidebar.header("2. Configure Columns")
+st.sidebar.header("2. Configure Analysis")
 metric_col = st.sidebar.text_input("Metric Column (e.g. CTR)", "CTR")
 image_name_col = st.sidebar.text_input("Image Name Column", "image_name")
+# --- NEW: Benchmark Input ---
+benchmark_val = st.sidebar.number_input("Benchmark Value (Split High/Low)", value=1.1, step=0.1)
 
 if st.sidebar.button("Run Analysis", use_container_width=True):
     if csv_file and uploaded_images:
@@ -318,13 +234,18 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
         
         display_full_data(res_df, metric_col, image_name_col)
         
+        # --- METRICS DISPLAY ---
         mean_val = res_df[metric_col].mean()
-        st.markdown(f"*(Average {metric_col}: {mean_val:.4f})*")
+        col1, col2 = st.columns(2)
+        col1.metric(label=f"Dataset Average {metric_col}", value=f"{mean_val:.4f}")
+        col2.metric(label="Benchmark Used", value=f"{benchmark_val}")
         
+        # --- SPLIT BY BENCHMARK ---
         display_aggregate_report(
-            res_df[res_df[metric_col] > mean_val], 
-            res_df[res_df[metric_col] <= mean_val], 
-            metric_col
+            res_df[res_df[metric_col] > benchmark_val], 
+            res_df[res_df[metric_col] <= benchmark_val], 
+            metric_col,
+            benchmark_val
         )
         
         best_worst_images = {}
