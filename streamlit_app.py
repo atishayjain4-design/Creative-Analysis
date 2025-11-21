@@ -16,7 +16,6 @@ def load_models():
     """Loads OpenCV and EasyOCR models into memory."""
     print("Loading models...")
     
-    # Use 'alt2' model for better face detection
     cascade_filename = 'haarcascade_frontalface_alt2.xml'
     cascade_url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_alt2.xml"
     
@@ -67,47 +66,69 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif texture_score < 60: visual_style = "Mixed"
         else: visual_style = "3D / Photo"
 
-        # --- Product Size Estimation (Contours) ---
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blurred, 50, 150)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # --- IMPROVED: Robust Product Size Estimation ---
+        # Old method: Simple contours (failed on complex objects)
+        # New method: Morphological Closing (connects disjointed parts into a solid mass)
         
-        product_area_pct = 0.0
+        # 1. Blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # 2. Edge Detection (Canny)
+        edges = cv2.Canny(blurred, 50, 150)
+        
+        # 3. Morphological Dilation/Closing
+        # This "thickens" the edges to connect gaps. 
+        # It turns a "sketch" of a shoe into a solid "blob" mask.
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+        
+        # 4. Find Contours on the "blob" image
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        significant_area = 0.0
         if contours:
-            contours = sorted(contours, key=cv2.contourArea, reverse=True)
             for c in contours:
                 area = cv2.contourArea(c)
-                # Heuristic: Ignore if it covers > 95% (border) or < 5% (noise)
-                if 0.05 * total_area < area < 0.95 * total_area:
-                    product_area_pct = (area / total_area) * 100
-                    break
+                
+                # Filter Logic:
+                # - Ignore tiny noise (< 1% of image)
+                # - Ignore frames/borders (if bounding box is basically the whole image)
+                x, y, w, h = cv2.boundingRect(c)
+                is_border = (w > 0.95 * width) or (h > 0.95 * height)
+                
+                if area > (0.01 * total_area) and not is_border:
+                    significant_area += area
         
-        # Generate labels for charting, but keep the exact float for the table
+        # Calculate percentage coverage
+        product_area_pct = (significant_area / total_area) * 100
+        
+        # Cap it at 100% just in case of overlap calculation errors
+        product_area_pct = min(product_area_pct, 100.0)
+        
         if product_area_pct < 15: product_size_bucket = "Small (<15%)"
         elif product_area_pct < 40: product_size_bucket = "Medium (15-40%)"
         else: product_size_bucket = "Large (>40%)"
 
-        # --- OCR Features (Advanced) ---
+        # --- OCR Features ---
         ocr_results = ocr_reader.readtext(image_bytes, detail=1, paragraph=False)
         
         all_text_parts = []
         max_font_height = 0
         max_text_length = 0
         
-        headline_text = "None" # Largest Font
-        main_body_text = "None" # Longest Text Block
+        headline_text = "None"
+        main_body_text = "None"
         
         for (bbox, text, prob) in ocr_results:
             all_text_parts.append(text)
             
-            # 1. Find Headline (Largest Font)
+            # Headline (Largest Font)
             box_height = bbox[2][1] - bbox[0][1]
             if box_height > max_font_height:
                 max_font_height = box_height
                 headline_text = text
             
-            # 2. Find Main Text (Longest String)
-            # We ignore single characters or super short words for "Main Text"
+            # Main Text (Longest Block)
             if len(text) > max_text_length and len(text) > 3:
                 max_text_length = len(text)
                 main_body_text = text
@@ -150,10 +171,10 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             extracted_price = re.sub(r"([A-Z])(₹)", r"\1 \2", extracted_price)
 
         return {
-            "headline_text": headline_text,       # Largest Font
-            "main_body_text": main_body_text,     # Longest Text Block (New Request)
-            "product_area_pct": product_area_pct, # Exact % (New Request)
-            "product_size_bucket": product_size_bucket, # For Aggregate Charting
+            "headline_text": headline_text,
+            "main_body_text": main_body_text,
+            "product_area_pct": product_area_pct,
+            "product_size_bucket": product_size_bucket,
             "visual_style": visual_style,
             "has_face": has_face,
             "brightness_level": brightness_level,
@@ -173,16 +194,16 @@ def display_full_data(df_sorted, metric, image_name_col):
     
     cols = [
         image_name_col, metric, 
-        'main_body_text', 'headline_text',  # Updated columns
-        'product_area_pct', # Exact %
+        'main_body_text', 'headline_text', 
+        'product_area_pct', 
         'extracted_price', 'extracted_offer', 
         'has_face', 'visual_style'
     ]
     cols = [c for c in cols if c in df_sorted.columns]
     
-    # Format the percentage for display
     display_df = df_sorted[cols].copy()
     if 'product_area_pct' in display_df.columns:
+        # Show exact float with 1 decimal place
         display_df['product_area_pct'] = display_df['product_area_pct'].apply(lambda x: f"{x:.1f}%")
 
     st.dataframe(display_df, use_container_width=True)
@@ -200,11 +221,10 @@ def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
             st.bar_chart(above_bench_df['visual_style'].value_counts(normalize=True))
             
     with col2:
-        st.markdown("### Product Image Size (Distribution)")
-        st.caption("We group the exact percentages into buckets for this chart.")
+        st.markdown("### Product Image Size")
+        st.caption("Buckets based on exact % coverage.")
         if not above_bench_df.empty:
             st.markdown("**Top Performers:**")
-            # Use the bucket column for the chart
             st.bar_chart(above_bench_df['product_size_bucket'].value_counts(normalize=True))
 
     # --- Face Detection ---
@@ -242,7 +262,6 @@ def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
 
 def display_best_vs_worst(df_sorted, metric, images_dict):
     st.markdown("--- \n ## 3. Best vs. Worst (Overall)")
-    
     if len(df_sorted) == 0: return
 
     best = df_sorted.iloc[0]
@@ -285,8 +304,13 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             face_cascade, ocr_reader = load_models()
             if not face_cascade: st.stop()
 
+        # --- ROBUST CSV LOADING ---
         try:
             df = pd.read_csv(csv_file)
+            # FORCE image column to string and STRIP whitespace
+            if image_name_col in df.columns:
+                df[image_name_col] = df[image_name_col].astype(str).str.strip()
+            
             if metric_col not in df.columns or image_name_col not in df.columns:
                 st.error(f"Columns not found! CSV has: {list(df.columns)}")
                 st.stop()
@@ -294,7 +318,8 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             st.error(f"CSV Error: {e}")
             st.stop()
 
-        images_dict = {f.name: f.getvalue() for f in uploaded_images}
+        # --- ROBUST IMAGE MAPPING ---
+        images_dict = {f.name.strip(): f.getvalue() for f in uploaded_images}
         
         all_features = []
         bar = st.progress(0, text="Analyzing...")
@@ -311,6 +336,14 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
         
         if not all_features:
             st.error("No matching images analyzed.")
+            with st.expander("Debug: Filename Mismatch Checker", expanded=True):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.write("**Filenames in CSV (First 5):**")
+                    st.write(df[image_name_col].head(5).tolist())
+                with col_b:
+                    st.write("**Filenames Uploaded (First 5):**")
+                    st.write(list(images_dict.keys())[:5])
             st.stop()
 
         res_df = pd.DataFrame(all_features)
