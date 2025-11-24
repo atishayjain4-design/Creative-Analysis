@@ -45,7 +45,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
         if image_cv is None: return {"error": "Decode failed"}
 
-        # Resize if too massive (helps with OCR speed/stability)
+        # Resize massive images to improve stability/speed
         h, w = image_cv.shape[:2]
         if max(h, w) > 1500:
             scale = 1500 / max(h, w)
@@ -67,13 +67,13 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif brightness < 180: brightness_level = "Medium (Balanced)"
         else: brightness_level = "High (Bright)"
 
-        # --- Visual Style ---
+        # --- Visual Style (2D vs 3D) ---
         texture_score = np.std(gray)
         if texture_score < 40: visual_style = "2D / Flat"
         elif texture_score < 60: visual_style = "Mixed"
         else: visual_style = "3D / Photo"
 
-        # --- ROBUST PRODUCT DETECTION (Morphological) ---
+        # --- ROBUST PRODUCT DETECTION (Morphological Method) ---
         # 1. Blur to reduce noise
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
@@ -81,7 +81,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         edges = cv2.Canny(blurred, 50, 150)
         
         # 3. Morphological Closing (Connect the edges into a blob)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) # Larger kernel to connect gaps
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         
         # 4. Find Contours & Create Mask
@@ -192,6 +192,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         return {
             "bg_label": bg_label,
             "contrast_label": contrast_label,
+            "contrast_val": round(contrast_val, 1),
             "headline_text": headline_text,
             "main_body_text": main_body_text,
             "product_area_pct": product_area_pct,
@@ -232,16 +233,21 @@ def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
     st.markdown("--- \n ## 2. Aggregate Analysis")
     st.markdown(f"Comparing **{len(above_bench_df)}** Top Performers (> {benchmark}) vs. **{len(below_bench_df)}** Low Performers (<= {benchmark}).")
 
+    # --- Visual Stats ---
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("### Visual Style")
         if not above_bench_df.empty:
+            st.markdown("**Top Performers:**")
             st.bar_chart(above_bench_df['visual_style'].value_counts(normalize=True))
+            
     with col2:
         st.markdown("### Product Size")
         if not above_bench_df.empty:
+            st.markdown("**Top Performers:**")
             st.bar_chart(above_bench_df['product_size_bucket'].value_counts(normalize=True))
 
+    # --- Background ---
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("### Background")
@@ -253,17 +259,19 @@ def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
             face_counts = above_bench_df['has_face'].astype(str).value_counts(normalize=True)
             st.bar_chart(face_counts.reindex(['True', 'False']).fillna(0))
     
+    # --- Top Callouts ---
     st.markdown("### Top Callouts")
-    col1, col2 = st.columns(2)
     
     def get_top_phrases(series):
         counts = Counter(series.dropna()).most_common(5)
         return pd.DataFrame(counts, columns=["Phrase", "Count"]) if counts else None
 
+    col1, col2 = st.columns(2)
     with col1:
         st.markdown(f"**Top Prices (> {benchmark})**")
         df_p = get_top_phrases(above_bench_df['extracted_price'])
         if df_p is not None: st.dataframe(df_p, use_container_width=True, hide_index=True)
+        
     with col2:
         st.markdown(f"**Top Offers (> {benchmark})**")
         df_o = get_top_phrases(above_bench_df['extracted_offer'])
@@ -312,7 +320,7 @@ benchmark_val = st.sidebar.number_input("Benchmark Value (Split High/Low)", valu
 
 if st.sidebar.button("Run Analysis", use_container_width=True):
     if csv_file and uploaded_images:
-        with st.spinner("Loading AI Models (This may take a minute on first run)..."):
+        with st.spinner("Loading AI Models..."):
             face_cascade, ocr_reader = load_models()
             if not face_cascade: st.stop()
 
