@@ -44,7 +44,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
         if image_cv is None: return {"error": "Decode failed"}
 
-        # Resize massive images
+        # Resize massive images to improve stability/speed
         h, w = image_cv.shape[:2]
         if max(h, w) > 1500:
             scale = 1500 / max(h, w)
@@ -72,13 +72,13 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif texture_score < 60: visual_style = "Mixed"
         else: visual_style = "3D / Photo"
 
-        # --- PRODUCT DETECTION ---
+        # --- PRODUCT DETECTION (Morphological) ---
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blurred, 50, 150)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         
-        # Mask Left Side for product detection
+        # Mask Left Side for product detection logic (assuming product is usually right/center)
         roi_start_x = int(width * 0.40) 
         closed[:, :roi_start_x] = 0 
         
@@ -155,12 +155,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
                 headline_text = text # This captures "Up to 28 hrs battery"
 
             # --- 2. Find "Title" (Product Name) ---
-            # Criteria:
-            # A. Left Side: Center X is in the left 60% of image
-            # B. Not Top: Center Y is below top 15% (skips logos)
-            # C. Not Bottom: Center Y is above bottom 15% (skips disclaimers)
-            # D. Biggest Font: Maximize box_height
-            
+            # Criteria: Left Side, Not Top Logo, Not Bottom Disclaimer, Big Font
             is_left = box_center_x < (width * 0.60)
             is_middle_vertical = (height * 0.15) < box_center_y < (height * 0.85)
             
@@ -207,8 +202,8 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             extracted_price = re.sub(r"([A-Z])(₹)", r"\1 \2", extracted_price)
 
         return {
-            "title_text": title_text,       # NEW: Left-aligned, big font title
-            "headline_text": headline_text, # Smart Benefit/Headline
+            "title_text": title_text,       
+            "headline_text": headline_text, 
             "bg_label": bg_label,
             "contrast_label": contrast_label,
             "product_area_pct": product_area_pct,
@@ -259,7 +254,6 @@ def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
             face_counts = above_bench_df['has_face'].astype(str).value_counts(normalize=True)
             st.bar_chart(face_counts.reindex(['True', 'False']).fillna(0))
     
-    # Callouts & Text
     st.markdown("### Top Text Elements")
     def get_top_phrases(series):
         counts = Counter(series.dropna()).most_common(5)
@@ -295,11 +289,15 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
     col1, col2 = st.columns(2)
     
     # Use safe lookup for images
-    def get_img_bytes(name, img_dict):
-        if name in img_dict: return img_dict[name]
-        for k in img_dict.keys():
-            if k.lower() == str(name).lower(): return img_dict[k]
+    def get_img_bytes(name, img_dict, img_lookup):
+        name_str = str(name).strip()
+        if name_str in img_dict: return img_dict[name_str]
+        if name_str.lower() in img_lookup: return img_dict[img_lookup[name_str.lower()]]
         return None
+
+    # Need to rebuild lookup here or pass it in. 
+    # For simplicity, we re-create the minimal lookup needed for display
+    img_lookup_display = {k.lower(): k for k in images_dict.keys()}
 
     for col, item, title in [(col1, best, "🥇 Best"), (col2, worst, "🥉 Worst")]:
         with col:
@@ -307,7 +305,7 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
             st.markdown(f"**{item[metric]:.4f}** ({metric})")
             
             img_name = item['image_name']
-            img_bytes = get_img_bytes(img_name, images_dict)
+            img_bytes = get_img_bytes(img_name, images_dict, img_lookup_display)
             
             if img_bytes:
                 st.image(img_bytes, use_column_width=True)
@@ -343,6 +341,7 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
 
         try:
             df = pd.read_csv(csv_file)
+            # Ensure image column is string and strip spaces
             if image_name_col in df.columns:
                 df[image_name_col] = df[image_name_col].astype(str).str.strip()
             
@@ -354,25 +353,33 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             st.stop()
 
         # --- SMART LOOKUP ---
+        # 1. Clean uploaded filenames
         images_dict = {f.name.strip(): f.getvalue() for f in uploaded_images}
+        
+        # 2. Build lookup table for relaxed matching
         images_lookup = {}
         for name in images_dict.keys():
-            images_lookup[name] = name 
-            images_lookup[name.lower()] = name 
+            images_lookup[name] = name # exact
+            images_lookup[name.lower()] = name # lowercase
             name_no_ext = os.path.splitext(name)[0]
-            images_lookup[name_no_ext] = name 
-            images_lookup[name_no_ext.lower()] = name 
+            images_lookup[name_no_ext] = name # no ext
+            images_lookup[name_no_ext.lower()] = name # lowercase no ext
 
         all_features = []
         bar = st.progress(0, text="Analyzing...")
         total_rows = len(df)
         
         for i, row in df.iterrows():
-            csv_name = row[image_name_col]
+            csv_name = row[image_name_col] # already stripped above
+            
+            # Try matching
             target_key = None
-            if csv_name in images_dict: target_key = csv_name
-            elif csv_name.lower() in images_lookup: target_key = images_lookup[csv_name.lower()]
-            elif csv_name in images_lookup: target_key = images_lookup[csv_name]
+            if csv_name in images_dict:
+                target_key = csv_name
+            elif csv_name.lower() in images_lookup:
+                target_key = images_lookup[csv_name.lower()]
+            elif csv_name in images_lookup:
+                target_key = images_lookup[csv_name]
                 
             if target_key:
                 feats = analyze_image_features(images_dict[target_key], face_cascade, ocr_reader)
@@ -384,6 +391,14 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
         
         if not all_features:
             st.error("No matching images analyzed.")
+            with st.expander("Debug: Mismatch Checker", expanded=True):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.write("**CSV Filenames (First 5):**")
+                    st.write(df[image_name_col].head(5).tolist())
+                with col_b:
+                    st.write("**Uploaded Filenames (First 5):**")
+                    st.write(list(images_dict.keys())[:5])
             st.stop()
 
         res_df = pd.DataFrame(all_features)
@@ -395,24 +410,7 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
         col1.metric(label=f"Dataset Average {metric_col}", value=f"{mean_val:.4f}")
         col2.metric(label="Benchmark Used", value=f"{benchmark_val}")
         
-        best_worst_images = {}
-        if not res_df.empty:
-            # Helper to find the image bytes again
-            def get_img_bytes(name):
-                if name in images_dict: return images_dict[name]
-                if name.lower() in images_lookup: return images_dict[images_lookup[name.lower()]]
-                return None
-
-            best_name = res_df.iloc[0][image_name_col]
-            worst_name = res_df.iloc[-1][image_name_col]
-            
-            best_bytes = get_img_bytes(best_name)
-            if best_bytes: best_worst_images[best_name] = best_bytes
-            
-            worst_bytes = get_img_bytes(worst_name)
-            if worst_bytes: best_worst_images[worst_name] = worst_bytes
-        
-        display_best_vs_worst(res_df, metric_col, best_worst_images)
+        display_best_vs_worst(res_df, metric_col, images_dict)
 
         display_aggregate_report(
             res_df[res_df[metric_col] > benchmark_val], 
