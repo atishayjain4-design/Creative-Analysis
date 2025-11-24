@@ -320,7 +320,7 @@ benchmark_val = st.sidebar.number_input("Benchmark Value (Split High/Low)", valu
 
 if st.sidebar.button("Run Analysis", use_container_width=True):
     if csv_file and uploaded_images:
-        with st.spinner("Loading AI Models..."):
+        with st.spinner("Loading AI Models (This may take a minute on first run)..."):
             face_cascade, ocr_reader = load_models()
             if not face_cascade: st.stop()
 
