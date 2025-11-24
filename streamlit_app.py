@@ -78,7 +78,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         
-        # Mask Left Side for product detection
+        # Mask Left Side for product detection logic
         roi_start_x = int(width * 0.40) 
         closed[:, :roi_start_x] = 0 
         
@@ -121,23 +121,21 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         else: contrast_label = "High Contrast"
 
         # --- REGEX DEFINITIONS ---
-        # We define these early to use them inside the loop
         hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+(?:/-)?)")
         loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+(?:/-)?)")
         offer_regex = re.compile(r"(\d{1,2}\s?% (?:OFF)?|SALE|FREE SHIPPING|FREE|BOGO|DEAL|OFFER|FLAT \d+%)")
 
         # --- TEXT ANALYSIS ---
-        # Use paragraph=True to group lines
         ocr_results = ocr_reader.readtext(image_cv, detail=1, paragraph=True)
         
         all_text_parts = []
-        text_blocks = [] # Store metadata for title logic
+        text_blocks = [] 
         
         headline_text = "None"
         max_score = 0
         boost_keywords = ["BATTERY", "HRS", "DAYS", "PROCESSOR", "RAM", "SSD", "CAMERA", "DISPLAY", "WARRANTY", "FREE", "OFF", "SALE"]
 
-        callout_y_top = float('inf') # Track the highest point of any callout found
+        callout_y_top = float('inf')
         has_callout_block = False
 
         for result in ocr_results:
@@ -161,9 +159,8 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
                 is_callout = True
                 has_callout_block = True
                 if box_top_y < callout_y_top:
-                    callout_y_top = box_top_y # Mark the top boundary of the callout section
+                    callout_y_top = box_top_y
 
-            # Store for later Title logic
             text_blocks.append({
                 'text': text,
                 'is_callout': is_callout,
@@ -173,7 +170,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
                 'area': box_area
             })
 
-            # --- Smart Headline (Benefit) Logic ---
+            # Smart Headline Logic
             score = box_area
             for keyword in boost_keywords:
                 if keyword in text_clean:
@@ -186,26 +183,22 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         raw_text = " ".join(all_text_parts)
         cleaned_text = raw_text.upper()
         
-        # --- TITLE DETECTION LOGIC (Updated) ---
+        # --- TITLE DETECTION LOGIC ---
         title_text = "None"
         
         if has_callout_block:
-            # Strategy A: Find the text block strictly ABOVE the callout
-            # Filter blocks that are above the callout line
+            # Find text strictly ABOVE callout
             candidates = [b for b in text_blocks if b['y_bottom'] < callout_y_top]
+            candidates.sort(key=lambda x: x['y_bottom'], reverse=True) # Closest first
             
-            # Sort by Y (lowest Y-bottom first -> closest to callout)
-            candidates.sort(key=lambda x: x['y_bottom'], reverse=True)
-            
-            # Pick the first reasonable candidate
             for cand in candidates:
-                # Heuristic: Must be on left-ish side and not tiny
+                # Heuristic: Left-ish side and significant height
                 if cand['cx'] < (width * 0.75) and cand['h'] > 15: 
                     title_text = cand['text']
                     break
         
         if title_text == "None":
-            # Strategy B: Fallback to Largest Font on Left (if no callout found or Strategy A failed)
+            # Fallback: Largest Font on Left
             max_title_h = 0
             for b in text_blocks:
                 is_left = b['cx'] < (width * 0.60)
@@ -331,15 +324,19 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
     
     col1, col2 = st.columns(2)
     
-    # Use safe lookup for images
+    # Smart Image Lookup
     def get_img_bytes(name, img_dict, img_lookup):
         name_str = str(name).strip()
         if name_str in img_dict: return img_dict[name_str]
         if name_str.lower() in img_lookup: return img_dict[img_lookup[name_str.lower()]]
         return None
 
-    # Need to rebuild lookup here
-    img_lookup_display = {k.lower(): k for k in images_dict.keys()}
+    # Rebuild lookup for display
+    img_lookup_display = {}
+    for name in images_dict.keys():
+        img_lookup_display[name.lower()] = name
+        name_no_ext = os.path.splitext(name)[0]
+        img_lookup_display[name_no_ext.lower()] = name
 
     for col, item, title in [(col1, best, "🥇 Best"), (col2, worst, "🥉 Worst")]:
         with col:
@@ -383,7 +380,7 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
 
         try:
             df = pd.read_csv(csv_file)
-            # Ensure image column is string and strip spaces
+            # Force column types and strip whitespace
             if image_name_col in df.columns:
                 df[image_name_col] = df[image_name_col].astype(str).str.strip()
             
@@ -411,7 +408,7 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
         for i, row in df.iterrows():
             csv_name = row[image_name_col]
             
-            # Try matching
+            # Try matching logic
             target_key = None
             if csv_name in images_dict: target_key = csv_name
             elif csv_name.lower() in images_lookup: target_key = images_lookup[csv_name.lower()]
