@@ -209,7 +209,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 # --- 2. REPORTING UI ---
 
 def display_full_data(df_sorted, metric, image_name_col):
-    st.markdown("--- \n ## 1. Detailed Data")
+    st.markdown("--- \n ## 3. Detailed Data") # Moved to Section 3
     
     cols = [
         image_name_col, metric, 
@@ -290,7 +290,7 @@ def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
 
 
 def display_best_vs_worst(df_sorted, metric, images_dict):
-    st.markdown("--- \n ## 3. Best vs. Worst (Overall)")
+    st.markdown("--- \n ## 1. Best vs. Worst (Overall)") # Moved to Section 1
     if len(df_sorted) == 0: return
 
     best = df_sorted.iloc[0]
@@ -380,20 +380,12 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
         res_df[metric_col] = pd.to_numeric(res_df[metric_col], errors='coerce')
         res_df = res_df.sort_values(by=metric_col, ascending=False)
         
-        display_full_data(res_df, metric_col, image_name_col)
-        
         mean_val = res_df[metric_col].mean()
         col1, col2 = st.columns(2)
         col1.metric(label=f"Dataset Average {metric_col}", value=f"{mean_val:.4f}")
         col2.metric(label="Benchmark Used", value=f"{benchmark_val}")
         
-        display_aggregate_report(
-            res_df[res_df[metric_col] > benchmark_val], 
-            res_df[res_df[metric_col] <= benchmark_val], 
-            metric_col,
-            benchmark_val
-        )
-        
+        # --- 1. BEST VS WORST (Now First) ---
         best_worst_images = {}
         if not res_df.empty:
             best_name = res_df.iloc[0][image_name_col]
@@ -404,5 +396,17 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
                 best_worst_images[worst_name] = images_dict[worst_name]
         
         display_best_vs_worst(res_df, metric_col, best_worst_images)
+
+        # --- 2. AGGREGATE REPORTS (Now Second) ---
+        display_aggregate_report(
+            res_df[res_df[metric_col] > benchmark_val], 
+            res_df[res_df[metric_col] <= benchmark_val], 
+            metric_col,
+            benchmark_val
+        )
+        
+        # --- 3. FULL DATA TABLE (Now Last) ---
+        display_full_data(res_df, metric_col, image_name_col)
+        
     else:
         st.warning("Please upload both CSV and Images.")
