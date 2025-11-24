@@ -44,7 +44,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
         if image_cv is None: return {"error": "Decode failed"}
 
-        # Resize massive images to improve stability/speed
+        # Resize massive images
         h, w = image_cv.shape[:2]
         if max(h, w) > 1500:
             scale = 1500 / max(h, w)
@@ -66,17 +66,22 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif brightness < 180: brightness_level = "Medium (Balanced)"
         else: brightness_level = "High (Bright)"
 
-        # --- Visual Style (2D vs 3D) ---
+        # --- Visual Style ---
         texture_score = np.std(gray)
         if texture_score < 40: visual_style = "2D / Flat"
         elif texture_score < 60: visual_style = "Mixed"
         else: visual_style = "3D / Photo"
 
-        # --- PRODUCT & BACKGROUND SEPARATION (Morphological) ---
+        # --- PRODUCT DETECTION ---
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blurred, 50, 150)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+        
+        # Mask Left Side for product detection
+        roi_start_x = int(width * 0.40) 
+        closed[:, :roi_start_x] = 0 
+        
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         product_mask = np.zeros_like(gray)
@@ -86,60 +91,83 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             for c in contours:
                 area = cv2.contourArea(c)
                 x, y, fw, fh = cv2.boundingRect(c)
-                # Ignore borders (>95%) and tiny noise (<2%)
                 is_border = (fw > 0.95 * width) or (fh > 0.95 * height)
-                
                 if area > (0.02 * total_area) and not is_border:
                     significant_area += area
                     cv2.drawContours(product_mask, [c], -1, 255, -1)
 
         product_area_pct = min((significant_area / total_area) * 100, 100.0)
-        
         if product_area_pct < 15: product_size_bucket = "Small (<15%)"
         elif product_area_pct < 40: product_size_bucket = "Medium (15-40%)"
         else: product_size_bucket = "Large (>40%)"
 
-        # --- BACKGROUND COLOR & CONTRAST ANALYSIS ---
+        # --- CONTRAST ---
         if cv2.countNonZero(product_mask) == 0:
             bg_brightness = np.mean(gray)
             contrast_val = 0
-            bg_label = "Unknown / Uniform"
+            bg_label = "Unknown"
         else:
             prod_brightness = cv2.mean(gray, mask=product_mask)[0]
             bg_mask = cv2.bitwise_not(product_mask)
             bg_brightness = cv2.mean(gray, mask=bg_mask)[0]
             contrast_val = abs(prod_brightness - bg_brightness)
             
-            if bg_brightness < 60: bg_label = "Dark / Black Background"
-            elif bg_brightness < 190: bg_label = "Medium / Grey Background"
-            else: bg_label = "Light / White Background"
+            if bg_brightness < 90: bg_label = "Dark Background"
+            elif bg_brightness < 170: bg_label = "Medium Background"
+            else: bg_label = "Light/White Background"
 
-        if contrast_val < 40: contrast_label = "Low Contrast (Blends In)"
+        if contrast_val < 40: contrast_label = "Low Contrast"
         elif contrast_val < 90: contrast_label = "Medium Contrast"
-        else: contrast_label = "High Contrast (Pops Out)"
+        else: contrast_label = "High Contrast"
 
-        # --- OCR Features ---
-        ocr_results = ocr_reader.readtext(image_cv, detail=1, paragraph=False)
+        # --- TEXT ANALYSIS ---
+        ocr_results = ocr_reader.readtext(image_cv, detail=1, paragraph=True)
         
         all_text_parts = []
-        max_font_height = 0
-        max_text_length = 0
-        headline_text = "None"
-        main_body_text = "None"
+        headline_text = "None" # This is the "Benefit" headline (Smart Score)
+        title_text = "None"    # This is the "Product Title" (Font Size + Position)
         
+        max_score = 0
+        max_title_height = 0
+        
+        boost_keywords = ["BATTERY", "HRS", "DAYS", "PROCESSOR", "RAM", "SSD", "CAMERA", "DISPLAY", "WARRANTY", "FREE", "OFF", "SALE"]
+
         for (bbox, text, prob) in ocr_results:
             all_text_parts.append(text)
             
-            # Headline (Height)
-            box_height = bbox[2][1] - bbox[0][1]
-            if box_height > max_font_height:
-                max_font_height = box_height
-                headline_text = text
+            # bbox = [[tl], [tr], [br], [bl]]
+            tl, tr, br, bl = bbox
+            box_width = tr[0] - tl[0]
+            box_height = bl[1] - tl[1]
+            box_center_x = (tl[0] + tr[0]) / 2
+            box_center_y = (tl[1] + bl[1]) / 2
+            box_area = box_width * box_height
             
-            # Main Text (Length)
-            if len(text) > max_text_length and len(text) > 3:
-                max_text_length = len(text)
-                main_body_text = text
+            # --- 1. Find "Smart Headline" (Benefit) ---
+            score = box_area
+            text_upper = text.upper()
+            for keyword in boost_keywords:
+                if keyword in text_upper:
+                    score *= 1.5
+                    break
+            if score > max_score:
+                max_score = score
+                headline_text = text # This captures "Up to 28 hrs battery"
+
+            # --- 2. Find "Title" (Product Name) ---
+            # Criteria:
+            # A. Left Side: Center X is in the left 60% of image
+            # B. Not Top: Center Y is below top 15% (skips logos)
+            # C. Not Bottom: Center Y is above bottom 15% (skips disclaimers)
+            # D. Biggest Font: Maximize box_height
+            
+            is_left = box_center_x < (width * 0.60)
+            is_middle_vertical = (height * 0.15) < box_center_y < (height * 0.85)
+            
+            if is_left and is_middle_vertical:
+                if box_height > max_title_height:
+                    max_title_height = box_height
+                    title_text = text # This captures "ASUS Vivobook S series"
 
         raw_text = " ".join(all_text_parts)
         cleaned_text = raw_text.upper()
@@ -179,15 +207,15 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             extracted_price = re.sub(r"([A-Z])(₹)", r"\1 \2", extracted_price)
 
         return {
+            "title_text": title_text,       # NEW: Left-aligned, big font title
+            "headline_text": headline_text, # Smart Benefit/Headline
             "bg_label": bg_label,
             "contrast_label": contrast_label,
-            "contrast_val": round(contrast_val, 1),
             "product_area_pct": product_area_pct,
             "product_size_bucket": product_size_bucket,
             "visual_style": visual_style,
             "has_face": has_face,
-            "headline_text": headline_text,
-            "main_body_text": main_body_text,
+            "brightness_level": brightness_level,
             "callout_type": callout_type,
             "extracted_price": extracted_price, 
             "extracted_offer": extracted_offer,
@@ -201,13 +229,12 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
 def display_full_data(df_sorted, metric, image_name_col):
     st.markdown("--- \n ## 3. Detailed Data")
-    
     cols = [
         image_name_col, metric, 
+        'title_text', 'headline_text', # Added Title
+        'extracted_price', 'extracted_offer',
         'bg_label', 'contrast_label',
-        'product_area_pct', 'main_body_text', 'headline_text',
-        'extracted_price', 'extracted_offer', 
-        'has_face', 'visual_style'
+        'product_area_pct', 'has_face'
     ]
     cols = [c for c in cols if c in df_sorted.columns]
     
@@ -227,36 +254,35 @@ def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
         if not above_bench_df.empty:
             st.bar_chart(above_bench_df['bg_label'].value_counts(normalize=True))
     with col2:
-        st.markdown("### Contrast")
-        if not above_bench_df.empty:
-            st.bar_chart(above_bench_df['contrast_label'].value_counts(normalize=True))
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("### Visual Style")
-        if not above_bench_df.empty:
-            st.bar_chart(above_bench_df['visual_style'].value_counts(normalize=True))
-    with col2:
         st.markdown("### Face Detection")
         if not above_bench_df.empty:
             face_counts = above_bench_df['has_face'].astype(str).value_counts(normalize=True)
             st.bar_chart(face_counts.reindex(['True', 'False']).fillna(0))
     
-    # Callouts
-    st.markdown("### Top Callouts")
+    # Callouts & Text
+    st.markdown("### Top Text Elements")
     def get_top_phrases(series):
         counts = Counter(series.dropna()).most_common(5)
         return pd.DataFrame(counts, columns=["Phrase", "Count"]) if counts else None
 
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown(f"**Top Prices (> {benchmark})**")
+        st.markdown(f"**Top Titles (Above Avg)**")
+        df_t = get_top_phrases(above_bench_df['title_text'])
+        if df_t is not None: st.dataframe(df_t, use_container_width=True, hide_index=True)
+        
+        st.markdown(f"**Top Prices (Above Avg)**")
         df_p = get_top_phrases(above_bench_df['extracted_price'])
         if df_p is not None: st.dataframe(df_p, use_container_width=True, hide_index=True)
+        
     with col2:
-        st.markdown(f"**Top Offers (> {benchmark})**")
-        df_o = get_top_phrases(above_bench_df['extracted_offer'])
-        if df_o is not None: st.dataframe(df_o, use_container_width=True, hide_index=True)
+        st.markdown(f"**Top Titles (Below Avg)**")
+        df_tb = get_top_phrases(below_bench_df['title_text'])
+        if df_tb is not None: st.dataframe(df_tb, use_container_width=True, hide_index=True)
+
+        st.markdown(f"**Top Prices (Below Avg)**")
+        df_pb = get_top_phrases(below_bench_df['extracted_price'])
+        if df_pb is not None: st.dataframe(df_pb, use_container_width=True, hide_index=True)
 
 
 def display_best_vs_worst(df_sorted, metric, images_dict):
@@ -268,10 +294,9 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
     
     col1, col2 = st.columns(2)
     
-    # Use safe lookup for images (handle case sensitivity)
+    # Use safe lookup for images
     def get_img_bytes(name, img_dict):
         if name in img_dict: return img_dict[name]
-        # Try case-insensitive search
         for k in img_dict.keys():
             if k.lower() == str(name).lower(): return img_dict[k]
         return None
@@ -289,10 +314,9 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
             else:
                 st.error(f"Image '{img_name}' not found.")
             
+            st.success(f"**Title:** {item.get('title_text', 'N/A')}")
+            st.success(f"**Headline:** {item.get('headline_text', 'N/A')}")
             st.info(f"**Background:** {item.get('bg_label', '-')}")
-            st.info(f"**Contrast:** {item.get('contrast_label', '-')} (Val: {item.get('contrast_val', 0)})")
-            st.success(f"**Main Text:** {item.get('main_body_text', 'N/A')}")
-            st.write(f"**Product Coverage:** {item.get('product_area_pct', 0):.1f}%")
             st.write(f"**Face:** {'Yes' if item.has_face else 'No'}")
             st.write(f"**Price:** {item.extracted_price or '-'}")
             st.write(f"**Offer:** {item.extracted_offer or '-'}")
@@ -329,16 +353,15 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             st.error(f"CSV Error: {e}")
             st.stop()
 
-        # --- ROBUST IMAGE MAPPING & SMART LOOKUP ---
+        # --- SMART LOOKUP ---
         images_dict = {f.name.strip(): f.getvalue() for f in uploaded_images}
-        # Create a lookup for case-insensitive and extension-less matching
         images_lookup = {}
         for name in images_dict.keys():
-            images_lookup[name] = name # exact
-            images_lookup[name.lower()] = name # lowercase
+            images_lookup[name] = name 
+            images_lookup[name.lower()] = name 
             name_no_ext = os.path.splitext(name)[0]
-            images_lookup[name_no_ext] = name # no extension
-            images_lookup[name_no_ext.lower()] = name # lowercase no extension
+            images_lookup[name_no_ext] = name 
+            images_lookup[name_no_ext.lower()] = name 
 
         all_features = []
         bar = st.progress(0, text="Analyzing...")
@@ -346,34 +369,21 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
         
         for i, row in df.iterrows():
             csv_name = row[image_name_col]
-            
-            # Try to find the matching image using our smart lookup
             target_key = None
-            if csv_name in images_dict:
-                target_key = csv_name
-            elif csv_name.lower() in images_lookup:
-                target_key = images_lookup[csv_name.lower()]
-            elif csv_name in images_lookup:
-                target_key = images_lookup[csv_name]
+            if csv_name in images_dict: target_key = csv_name
+            elif csv_name.lower() in images_lookup: target_key = images_lookup[csv_name.lower()]
+            elif csv_name in images_lookup: target_key = images_lookup[csv_name]
                 
             if target_key:
                 feats = analyze_image_features(images_dict[target_key], face_cascade, ocr_reader)
                 if "error" not in feats:
-                    all_features.append({**row.to_dict(), **feats, 'image_name': csv_name}) # Keep CSV name
+                    all_features.append({**row.to_dict(), **feats, 'image_name': csv_name})
             
             bar.progress((i + 1) / total_rows)
         bar.empty()
         
         if not all_features:
             st.error("No matching images analyzed.")
-            with st.expander("Debug: Mismatch Checker", expanded=True):
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.write("**CSV Filenames (First 5):**")
-                    st.write(df[image_name_col].head(5).tolist())
-                with col_b:
-                    st.write("**Uploaded Filenames (First 5):**")
-                    st.write(list(images_dict.keys())[:5])
             st.stop()
 
         res_df = pd.DataFrame(all_features)
@@ -385,7 +395,24 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
         col1.metric(label=f"Dataset Average {metric_col}", value=f"{mean_val:.4f}")
         col2.metric(label="Benchmark Used", value=f"{benchmark_val}")
         
-        display_best_vs_worst(res_df, metric_col, images_dict)
+        best_worst_images = {}
+        if not res_df.empty:
+            # Helper to find the image bytes again
+            def get_img_bytes(name):
+                if name in images_dict: return images_dict[name]
+                if name.lower() in images_lookup: return images_dict[images_lookup[name.lower()]]
+                return None
+
+            best_name = res_df.iloc[0][image_name_col]
+            worst_name = res_df.iloc[-1][image_name_col]
+            
+            best_bytes = get_img_bytes(best_name)
+            if best_bytes: best_worst_images[best_name] = best_bytes
+            
+            worst_bytes = get_img_bytes(worst_name)
+            if worst_bytes: best_worst_images[worst_name] = worst_bytes
+        
+        display_best_vs_worst(res_df, metric_col, best_worst_images)
 
         display_aggregate_report(
             res_df[res_df[metric_col] > benchmark_val], 
