@@ -61,30 +61,24 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(50, 50))
         has_face = len(faces) > 0
         
-        # Brightness
-        brightness = np.mean(gray)
-        if brightness < 90: brightness_level = "Low (Dark)"
-        elif brightness < 180: brightness_level = "Medium (Balanced)"
-        else: brightness_level = "High (Bright)"
-
-        # --- Visual Style (2D vs 3D) ---
+        # Visual Style (Texture)
         texture_score = np.std(gray)
         if texture_score < 40: visual_style = "2D / Flat"
         elif texture_score < 60: visual_style = "Mixed"
         else: visual_style = "3D / Photo"
 
-        # --- ROBUST PRODUCT DETECTION (Morphological Method) ---
+        # --- PRODUCT & BACKGROUND SEPARATION (Morphological) ---
         # 1. Blur to reduce noise
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
         # 2. Edge Detection
         edges = cv2.Canny(blurred, 50, 150)
         
-        # 3. Morphological Closing (Connect the edges into a blob)
+        # 3. Morphological Closing (Connect edges to form solid objects)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         
-        # 4. Find Contours & Create Mask
+        # 4. Find Contours
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         product_mask = np.zeros_like(gray)
@@ -107,27 +101,31 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif product_area_pct < 40: product_size_bucket = "Medium (15-40%)"
         else: product_size_bucket = "Large (>40%)"
 
-        # --- CONTRAST ANALYSIS ---
+        # --- BACKGROUND COLOR & CONTRAST ANALYSIS ---
         if cv2.countNonZero(product_mask) == 0:
+            # If no product detected, assume whole image is background
             bg_brightness = np.mean(gray)
             contrast_val = 0
-            bg_label = "Unknown"
+            bg_label = "Unknown / Uniform"
         else:
             # Brightness INSIDE mask (Product)
             prod_brightness = cv2.mean(gray, mask=product_mask)[0]
+            
             # Brightness OUTSIDE mask (Background)
             bg_mask = cv2.bitwise_not(product_mask)
             bg_brightness = cv2.mean(gray, mask=bg_mask)[0]
             
+            # Contrast is the difference
             contrast_val = abs(prod_brightness - bg_brightness)
             
-            if bg_brightness < 90: bg_label = "Dark Background"
-            elif bg_brightness < 170: bg_label = "Medium Background"
-            else: bg_label = "Light/White Background"
+            # Label Background
+            if bg_brightness < 60: bg_label = "Dark / Black Background"
+            elif bg_brightness < 190: bg_label = "Medium / Grey Background"
+            else: bg_label = "Light / White Background"
 
-        if contrast_val < 40: contrast_label = "Low Contrast"
+        if contrast_val < 40: contrast_label = "Low Contrast (Blends In)"
         elif contrast_val < 90: contrast_label = "Medium Contrast"
-        else: contrast_label = "High Contrast"
+        else: contrast_label = "High Contrast (Pops Out)"
 
         # --- OCR Features ---
         ocr_results = ocr_reader.readtext(image_cv, detail=1, paragraph=False)
@@ -155,7 +153,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         raw_text = " ".join(all_text_parts)
         cleaned_text = raw_text.upper()
         
-        # --- PRICE EXTRACTION (Smart) ---
+        # --- PRICE EXTRACTION ---
         hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+(?:/-)?)")
         loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+(?:/-)?)")
         suffix_price_regex = re.compile(r"([\d,.]+/-)")
@@ -193,13 +191,12 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             "bg_label": bg_label,
             "contrast_label": contrast_label,
             "contrast_val": round(contrast_val, 1),
-            "headline_text": headline_text,
-            "main_body_text": main_body_text,
             "product_area_pct": product_area_pct,
             "product_size_bucket": product_size_bucket,
             "visual_style": visual_style,
             "has_face": has_face,
-            "brightness_level": brightness_level,
+            "headline_text": headline_text,
+            "main_body_text": main_body_text,
             "callout_type": callout_type,
             "extracted_price": extracted_price, 
             "extracted_offer": extracted_offer,
@@ -233,31 +230,45 @@ def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
     st.markdown("--- \n ## 2. Aggregate Analysis")
     st.markdown(f"Comparing **{len(above_bench_df)}** Top Performers (> {benchmark}) vs. **{len(below_bench_df)}** Low Performers (<= {benchmark}).")
 
-    # --- Visual Stats ---
+    # --- Background & Contrast Analysis ---
+    st.markdown("### 🎨 Background & Contrast")
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("### Visual Style")
-        if not above_bench_df.empty:
-            st.markdown("**Top Performers:**")
-            st.bar_chart(above_bench_df['visual_style'].value_counts(normalize=True))
-            
-    with col2:
-        st.markdown("### Product Size")
-        if not above_bench_df.empty:
-            st.markdown("**Top Performers:**")
-            st.bar_chart(above_bench_df['product_size_bucket'].value_counts(normalize=True))
-
-    # --- Background ---
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("### Background")
+        st.markdown("**Background Color (Top Performers)**")
         if not above_bench_df.empty:
             st.bar_chart(above_bench_df['bg_label'].value_counts(normalize=True))
     with col2:
-        st.markdown("### Face Detection")
+        st.markdown("**Contrast Level (Top Performers)**")
         if not above_bench_df.empty:
+            st.bar_chart(above_bench_df['contrast_label'].value_counts(normalize=True))
+
+    st.divider()
+
+    # --- Visual Stats ---
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### Visual Style (2D/3D)")
+        if not above_bench_df.empty:
+            st.bar_chart(above_bench_df['visual_style'].value_counts(normalize=True))
+            
+    with col2:
+        st.markdown("### Product Coverage")
+        if not above_bench_df.empty:
+            st.bar_chart(above_bench_df['product_size_bucket'].value_counts(normalize=True))
+
+    # --- Face Detection ---
+    st.markdown("### Human Element (Has Face?)")
+    col1, col2 = st.columns(2)
+    with col1:
+        if not above_bench_df.empty:
+            st.markdown(f"**Above {benchmark}**")
             face_counts = above_bench_df['has_face'].astype(str).value_counts(normalize=True)
             st.bar_chart(face_counts.reindex(['True', 'False']).fillna(0))
+    with col2:
+        if not below_bench_df.empty:
+            st.markdown(f"**Below {benchmark}**")
+            face_counts_below = below_bench_df['has_face'].astype(str).value_counts(normalize=True)
+            st.bar_chart(face_counts_below.reindex(['True', 'False']).fillna(0))
     
     # --- Top Callouts ---
     st.markdown("### Top Callouts")
@@ -296,10 +307,10 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
             if item['image_name'] in images_dict:
                 st.image(images_dict[item['image_name']], use_column_width=True)
             
-            st.success(f"**Headline:** {item.get('headline_text', 'N/A')}")
-            st.info(f"**Main Text:** {item.get('main_body_text', 'N/A')}")
             st.info(f"**Background:** {item.get('bg_label', '-')}")
-            st.info(f"**Product Coverage:** {item.get('product_area_pct', 0):.1f}%")
+            st.info(f"**Contrast:** {item.get('contrast_label', '-')} (Val: {item.get('contrast_val', 0)})")
+            st.success(f"**Main Text:** {item.get('main_body_text', 'N/A')}")
+            st.write(f"**Product Coverage:** {item.get('product_area_pct', 0):.1f}%")
             st.write(f"**Face:** {'Yes' if item.has_face else 'No'}")
             st.write(f"**Price:** {item.extracted_price or '-'}")
             st.write(f"**Offer:** {item.extracted_offer or '-'}")
@@ -320,7 +331,7 @@ benchmark_val = st.sidebar.number_input("Benchmark Value (Split High/Low)", valu
 
 if st.sidebar.button("Run Analysis", use_container_width=True):
     if csv_file and uploaded_images:
-        with st.spinner("Loading AI Models (This may take a minute on first run)..."):
+        with st.spinner("Loading AI Models..."):
             face_cascade, ocr_reader = load_models()
             if not face_cascade: st.stop()
 
