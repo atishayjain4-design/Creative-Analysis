@@ -33,7 +33,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         file_bytes = np.asarray(bytearray(image_bytes), dtype=np.uint8)
         image_cv = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-        if image_cv is None: return {"error": "Image Decode Failed"}
+        if image_cv is None: return {"error": "Decode Failed"}
 
         # Resize for stability
         h, w = image_cv.shape[:2]
@@ -54,6 +54,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif brightness < 180: brightness_level = "Medium (Balanced)"
         else: brightness_level = "High (Bright)"
 
+        # --- Visual Style ---
         texture_score = np.std(gray)
         if texture_score < 40: visual_style = "2D / Flat"
         elif texture_score < 60: visual_style = "Mixed"
@@ -65,6 +66,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         
+        # Mask Left Side
         roi_start_x = int(width * 0.40) 
         closed[:, :roi_start_x] = 0 
         
@@ -107,21 +109,11 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         else: contrast_label = "High Contrast"
 
         # --- TEXT ANALYSIS (Stable Mode) ---
-        # Convert to RGB for better OCR accuracy
         image_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
-        
-        # Use paragraph=False for maximum stability (returns box, text, conf)
         ocr_results = ocr_reader.readtext(image_rgb, detail=1, paragraph=False)
         
-        all_text_parts = []
-        text_blocks = [] 
+        text_blocks = []
         
-        headline_text = "None"
-        max_score = 0
-        
-        # Keywords to boost "Benefit" headlines
-        boost_keywords = ["BATTERY", "HRS", "DAYS", "PROCESSOR", "RAM", "SSD", "CAMERA", "DISPLAY", "WARRANTY", "FREE", "OFF", "SALE"]
-
         hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+(?:/-)?)")
         loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+(?:/-)?)")
         offer_regex = re.compile(r"(\d{1,2}\s?% (?:OFF)?|SALE|FREE SHIPPING|FREE|BOGO|DEAL|OFFER|FLAT \d+%)")
@@ -130,10 +122,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         has_callout_block = False
 
         for result in ocr_results:
-            # Safe unpacking for paragraph=False
             bbox, text, conf = result
-            
-            all_text_parts.append(text)
             text_clean = text.upper()
             
             # Geometry
@@ -145,7 +134,6 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             box_top_y = tl[1]
             box_bottom_y = bl[1]
             
-            # Check Callout
             is_callout = False
             if hook_price_regex.search(text_clean) or loose_price_regex.search(text_clean) or offer_regex.search(text_clean):
                 is_callout = True
@@ -157,49 +145,51 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
                 'text': text,
                 'h': box_height,
                 'cx': box_center_x,
+                'y_top': box_top_y,
                 'y_bottom': box_bottom_y,
                 'area': box_area
             })
 
-            # Smart Headline Score (Area + Keywords)
-            score = box_area
-            for keyword in boost_keywords:
-                if keyword in text_clean:
-                    score *= 1.5
-                    break
-            if score > max_score:
-                max_score = score
-                headline_text = text
-
-        raw_text = " ".join(all_text_parts)
-        cleaned_text = raw_text.upper()
+        # --- 1. CONSTRUCT "HEADLINE" (ALL SIGNIFICANT TEXT) ---
+        # Filter: Ignore very small text (likely disclaimers/noise) unless it's the callout
+        # Threshold: Area > 0.5% of image or Height > 15px
+        significant_blocks = [
+            b for b in text_blocks 
+            if (b['area'] > (total_area * 0.005)) or (b['h'] > 15)
+        ]
         
-        # --- TITLE DETECTION ---
+        # Sort Top-to-Bottom to read naturally
+        significant_blocks.sort(key=lambda x: x['y_top'])
+        
+        # Join them
+        if significant_blocks:
+            headline_text = " | ".join([b['text'] for b in significant_blocks])
+        else:
+            headline_text = "None"
+            
+        # --- 2. TITLE DETECTION (Top-most, Left-aligned, Big) ---
         title_text = "None"
-        
         if has_callout_block:
-            # Strategy A: Text strictly above the callout
+            # Candidates ABOVE callout
             candidates = [b for b in text_blocks if b['y_bottom'] < callout_y_top]
             candidates.sort(key=lambda x: x['y_bottom'], reverse=True) # Closest first
-            
             for cand in candidates:
-                # Heuristic: Left-ish side and significant height
                 if cand['cx'] < (width * 0.75) and cand['h'] > 15: 
                     title_text = cand['text']
                     break
-        
         if title_text == "None":
-            # Strategy B: Largest Font on Left (Fallback)
+            # Fallback: Largest Font on Left
             max_title_h = 0
             for b in text_blocks:
-                is_left = b['cx'] < (width * 0.60)
-                is_middle = (height * 0.10) < b['y_bottom'] < (height * 0.90)
-                if is_left and is_middle:
+                if b['cx'] < (width * 0.60) and (height * 0.10) < b['y_bottom'] < (height * 0.90):
                     if b['h'] > max_title_h:
                         max_title_h = b['h']
                         title_text = b['text']
 
         # --- PRICE EXTRACTION ---
+        raw_text = " ".join([b['text'] for b in text_blocks])
+        cleaned_text = raw_text.upper()
+        
         callout_type = "None"
         extracted_price = None
         extracted_offer = None
@@ -230,7 +220,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
         return {
             "title_text": title_text,       
-            "headline_text": headline_text, 
+            "headline_text": headline_text, # Now contains ALL significant text
             "bg_label": bg_label,
             "contrast_label": contrast_label,
             "product_area_pct": product_area_pct,
@@ -244,22 +234,19 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             "raw_text": raw_text
         }
     except Exception as e:
-        # Return the specific error so we can see it in the table
         return {"error": str(e)}
 
 # --- 2. REPORTING UI ---
 
 def display_full_data(df_sorted, metric, image_name_col):
     st.markdown("--- \n ## 3. Detailed Data")
-    
-    # Show error column if it exists
-    cols = [image_name_col, metric, 'title_text', 'headline_text', 'extracted_price', 'extracted_offer']
-    if 'error' in df_sorted.columns:
-        cols.append('error')
-    
-    cols += ['bg_label', 'contrast_label', 'product_area_pct', 'has_face']
-    
-    # Filter for existing columns
+    cols = [
+        image_name_col, metric, 
+        'title_text', 'headline_text', # Now shows full text
+        'extracted_price', 'extracted_offer',
+        'bg_label', 'contrast_label',
+        'product_area_pct', 'has_face'
+    ]
     cols = [c for c in cols if c in df_sorted.columns]
     
     display_df = df_sorted[cols].copy()
@@ -317,7 +304,6 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
     
     col1, col2 = st.columns(2)
     
-    # Smart Image Lookup
     def get_img_bytes(name, img_dict, img_lookup):
         name_str = str(name).strip()
         if name_str in img_dict: return img_dict[name_str]
@@ -333,7 +319,7 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
     for col, item, title in [(col1, best, "🥇 Best"), (col2, worst, "🥉 Worst")]:
         with col:
             st.markdown(f"### {title}")
-            st.markdown(f"**{item[metric]}** ({metric})")
+            st.markdown(f"**{item[metric]:.4f}** ({metric})")
             
             img_name = item['image_name']
             img_bytes = get_img_bytes(img_name, images_dict, img_lookup_display)
@@ -347,7 +333,9 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
                 st.error(f"Analysis Failed: {item['error']}")
             else:
                 st.success(f"**Title:** {item.get('title_text', 'N/A')}")
-                st.success(f"**Headline:** {item.get('headline_text', 'N/A')}")
+                # Show full text in an expander to keep UI clean
+                with st.expander("See Full Headline/Copy"):
+                    st.write(item.get('headline_text', 'N/A'))
                 st.info(f"**Background:** {item.get('bg_label', '-')}")
                 st.write(f"**Face:** {'Yes' if item.has_face else 'No'}")
                 st.write(f"**Price:** {item.extracted_price or '-'}")
@@ -385,7 +373,6 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             st.error(f"CSV Error: {e}")
             st.stop()
 
-        # --- SMART LOOKUP ---
         images_dict = {f.name.strip(): f.getvalue() for f in uploaded_images}
         images_lookup = {}
         for name in images_dict.keys():
@@ -401,7 +388,6 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
         
         for i, row in df.iterrows():
             csv_name = row[image_name_col]
-            
             target_key = None
             if csv_name in images_dict: target_key = csv_name
             elif csv_name.lower() in images_lookup: target_key = images_lookup[csv_name.lower()]
@@ -409,7 +395,6 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
                 
             if target_key:
                 feats = analyze_image_features(images_dict[target_key], face_cascade, ocr_reader)
-                # ALWAYS append, even if there's an error, so we can see it in the table
                 all_features.append({**row.to_dict(), **feats, 'image_name': csv_name})
             
             bar.progress((i + 1) / total_rows)
@@ -421,12 +406,10 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
 
         res_df = pd.DataFrame(all_features)
         
-        # Safe numeric conversion
         if metric_col in res_df.columns:
             res_df[metric_col] = pd.to_numeric(res_df[metric_col], errors='coerce')
             res_df = res_df.sort_values(by=metric_col, ascending=False)
         
-        # Separate valid analysis from errors for aggregation
         valid_df = res_df[res_df.get('error').isna()] if 'error' in res_df.columns else res_df
         
         mean_val = 0
