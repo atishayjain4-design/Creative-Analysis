@@ -2,3 +2,7 @@ streamlit
 pandas
 easyocr
 opencv-python-headless
+rembg
+onnxruntime
+pillow
+numpy
