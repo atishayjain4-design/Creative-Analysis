@@ -61,24 +61,37 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(50, 50))
         has_face = len(faces) > 0
         
-        # Visual Style (Texture)
+        # Brightness
+        brightness = np.mean(gray)
+        if brightness < 90: brightness_level = "Low (Dark)"
+        elif brightness < 180: brightness_level = "Medium (Balanced)"
+        else: brightness_level = "High (Bright)"
+
+        # --- Visual Style (2D vs 3D) ---
         texture_score = np.std(gray)
         if texture_score < 40: visual_style = "2D / Flat"
         elif texture_score < 60: visual_style = "Mixed"
         else: visual_style = "3D / Photo"
 
-        # --- PRODUCT & BACKGROUND SEPARATION (Morphological) ---
+        # --- ROBUST PRODUCT DETECTION (Right-Side Focus) ---
         # 1. Blur to reduce noise
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
         # 2. Edge Detection
         edges = cv2.Canny(blurred, 50, 150)
         
-        # 3. Morphological Closing (Connect edges to form solid objects)
+        # 3. Morphological Closing (Connect the edges into a blob)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         
-        # 4. Find Contours
+        # --- NEW: MASK THE LEFT SIDE ---
+        # We zero out the left 40% of the processed image to ensure we only 
+        # find product contours on the right side (where products usually are).
+        # This prevents large text on the left from being counted as "Product".
+        roi_start_x = int(width * 0.40) 
+        closed[:, :roi_start_x] = 0 
+        
+        # 4. Find Contours & Create Mask
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         product_mask = np.zeros_like(gray)
@@ -101,31 +114,27 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif product_area_pct < 40: product_size_bucket = "Medium (15-40%)"
         else: product_size_bucket = "Large (>40%)"
 
-        # --- BACKGROUND COLOR & CONTRAST ANALYSIS ---
+        # --- CONTRAST ANALYSIS ---
         if cv2.countNonZero(product_mask) == 0:
-            # If no product detected, assume whole image is background
             bg_brightness = np.mean(gray)
             contrast_val = 0
-            bg_label = "Unknown / Uniform"
+            bg_label = "Unknown"
         else:
             # Brightness INSIDE mask (Product)
             prod_brightness = cv2.mean(gray, mask=product_mask)[0]
-            
             # Brightness OUTSIDE mask (Background)
             bg_mask = cv2.bitwise_not(product_mask)
             bg_brightness = cv2.mean(gray, mask=bg_mask)[0]
             
-            # Contrast is the difference
             contrast_val = abs(prod_brightness - bg_brightness)
             
-            # Label Background
-            if bg_brightness < 60: bg_label = "Dark / Black Background"
-            elif bg_brightness < 190: bg_label = "Medium / Grey Background"
-            else: bg_label = "Light / White Background"
+            if bg_brightness < 90: bg_label = "Dark Background"
+            elif bg_brightness < 170: bg_label = "Medium Background"
+            else: bg_label = "Light/White Background"
 
-        if contrast_val < 40: contrast_label = "Low Contrast (Blends In)"
+        if contrast_val < 40: contrast_label = "Low Contrast"
         elif contrast_val < 90: contrast_label = "Medium Contrast"
-        else: contrast_label = "High Contrast (Pops Out)"
+        else: contrast_label = "High Contrast"
 
         # --- OCR Features ---
         ocr_results = ocr_reader.readtext(image_cv, detail=1, paragraph=False)
@@ -153,7 +162,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         raw_text = " ".join(all_text_parts)
         cleaned_text = raw_text.upper()
         
-        # --- PRICE EXTRACTION ---
+        # --- PRICE EXTRACTION (Smart) ---
         hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+(?:/-)?)")
         loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+(?:/-)?)")
         suffix_price_regex = re.compile(r"([\d,.]+/-)")
@@ -191,12 +200,13 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             "bg_label": bg_label,
             "contrast_label": contrast_label,
             "contrast_val": round(contrast_val, 1),
+            "headline_text": headline_text,
+            "main_body_text": main_body_text,
             "product_area_pct": product_area_pct,
             "product_size_bucket": product_size_bucket,
             "visual_style": visual_style,
             "has_face": has_face,
-            "headline_text": headline_text,
-            "main_body_text": main_body_text,
+            "brightness_level": brightness_level,
             "callout_type": callout_type,
             "extracted_price": extracted_price, 
             "extracted_offer": extracted_offer,
@@ -209,7 +219,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 # --- 2. REPORTING UI ---
 
 def display_full_data(df_sorted, metric, image_name_col):
-    st.markdown("--- \n ## 3. Detailed Data") # Moved to Section 3
+    st.markdown("--- \n ## 3. Detailed Data") 
     
     cols = [
         image_name_col, metric, 
@@ -290,7 +300,7 @@ def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
 
 
 def display_best_vs_worst(df_sorted, metric, images_dict):
-    st.markdown("--- \n ## 1. Best vs. Worst (Overall)") # Moved to Section 1
+    st.markdown("--- \n ## 1. Best vs. Worst (Overall)") 
     if len(df_sorted) == 0: return
 
     best = df_sorted.iloc[0]
@@ -385,7 +395,7 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
         col1.metric(label=f"Dataset Average {metric_col}", value=f"{mean_val:.4f}")
         col2.metric(label="Benchmark Used", value=f"{benchmark_val}")
         
-        # --- 1. BEST VS WORST (Now First) ---
+        # --- 1. BEST VS WORST (First) ---
         best_worst_images = {}
         if not res_df.empty:
             best_name = res_df.iloc[0][image_name_col]
@@ -397,7 +407,7 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
         
         display_best_vs_worst(res_df, metric_col, best_worst_images)
 
-        # --- 2. AGGREGATE REPORTS (Now Second) ---
+        # --- 2. AGGREGATE REPORTS (Second) ---
         display_aggregate_report(
             res_df[res_df[metric_col] > benchmark_val], 
             res_df[res_df[metric_col] <= benchmark_val], 
@@ -405,7 +415,7 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             benchmark_val
         )
         
-        # --- 3. FULL DATA TABLE (Now Last) ---
+        # --- 3. FULL DATA TABLE (Last) ---
         display_full_data(res_df, metric_col, image_name_col)
         
     else:
