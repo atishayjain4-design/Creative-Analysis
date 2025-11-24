@@ -68,6 +68,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         
+        # Mask Left Side for product detection logic
         roi_start_x = int(width * 0.40) 
         closed[:, :roi_start_x] = 0 
         
@@ -257,7 +258,7 @@ def display_full_data(df_sorted, metric, image_name_col):
         'title_text', 'headline_text', 
         'extracted_price', 'extracted_offer',
         'bg_label', 'contrast_label',
-        'product_area_pct', 'has_face'
+        'product_size_bucket', 'product_area_pct', 'has_face'
     ]
     cols = [c for c in cols if c in df_sorted.columns]
     
@@ -281,6 +282,26 @@ def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
         if not above_bench_df.empty:
             face_counts = above_bench_df['has_face'].astype(str).value_counts(normalize=True)
             st.bar_chart(face_counts.reindex(['True', 'False']).fillna(0))
+    
+    # --- NEW SECTION: Contrast & Size ---
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### Contrast Level")
+        if not above_bench_df.empty:
+            st.caption(f"Above {benchmark}")
+            st.bar_chart(above_bench_df['contrast_label'].value_counts(normalize=True))
+        if not below_bench_df.empty:
+            st.caption(f"Below {benchmark}")
+            st.bar_chart(below_bench_df['contrast_label'].value_counts(normalize=True))
+
+    with col2:
+        st.markdown("### Product Size")
+        if not above_bench_df.empty:
+            st.caption(f"Above {benchmark}")
+            st.bar_chart(above_bench_df['product_size_bucket'].value_counts(normalize=True))
+        if not below_bench_df.empty:
+            st.caption(f"Below {benchmark}")
+            st.bar_chart(below_bench_df['product_size_bucket'].value_counts(normalize=True))
     
     st.markdown("### Top Text Elements")
     def get_top_phrases(series):
@@ -345,9 +366,9 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
                 with st.expander("See Full Headline"):
                     st.write(item.get('headline_text', 'N/A'))
                 st.info(f"**Background:** {item.get('bg_label', '-')}")
-                st.info(f"**Contrast:** {item.get('contrast_label', '-')}")
+                st.info(f"**Contrast:** {item.get('contrast_label', '-')} ({item.get('contrast_val', 0):.1f})")
+                st.write(f"**Product Size:** {item.get('product_size_bucket', 'N/A')} ({item.get('product_area_pct', 0):.1f}%)")
                 st.write(f"**Face:** {'Yes' if item.has_face else 'No'}")
-                st.write(f"**Product Size:** {item.get('product_area_pct', 0):.1f}%")
                 st.write(f"**Price:** {item.extracted_price or '-'}")
                 st.write(f"**Offer:** {item.extracted_offer or '-'}")
 
