@@ -20,7 +20,6 @@ def load_models():
     cascade_url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_alt2.xml"
     
     if not os.path.exists(cascade_filename):
-        print(f"Model not found. Downloading {cascade_filename}...")
         try:
             urllib.request.urlretrieve(cascade_url, cascade_filename)
         except Exception as e:
@@ -30,6 +29,91 @@ def load_models():
     face_cascade = cv2.CascadeClassifier(cascade_filename)
     ocr_reader = easyocr.Reader(['en'], gpu=False)
     return face_cascade, ocr_reader
+
+def merge_text_blocks(raw_results, image_width):
+    """
+    Manually groups separate words into lines based on vertical alignment.
+    Fixes the issue where 'ASUS' and 'Vivobook' are seen as different blocks.
+    """
+    if not raw_results:
+        return []
+
+    # Format: [ [bbox, text, conf], ... ]
+    # Sort by Top-Y first
+    sorted_results = sorted(raw_results, key=lambda x: x[0][0][1])
+    
+    merged_lines = []
+    current_line = []
+    
+    for res in sorted_results:
+        bbox, text, conf = res
+        tl, tr, br, bl = bbox
+        
+        # Calculate box stats
+        top = tl[1]
+        bottom = bl[1]
+        left = tl[0]
+        right = tr[0]
+        height = bottom - top
+        
+        if not current_line:
+            current_line = {
+                'text': text,
+                'top': top,
+                'bottom': bottom,
+                'left': left,
+                'right': right,
+                'height': height,
+                'count': 1
+            }
+            continue
+            
+        # Check if this word belongs on the same line
+        # Criteria: Vertical overlap > 50%
+        prev = current_line
+        vertical_overlap = min(prev['bottom'], bottom) - max(prev['top'], top)
+        overlap_ratio = vertical_overlap / min(prev['height'], height)
+        
+        if overlap_ratio > 0.5:
+            # It's on the same line, merge it
+            current_line['text'] += " " + text
+            current_line['right'] = right # Extend width
+            current_line['bottom'] = max(current_line['bottom'], bottom)
+            current_line['height'] = max(current_line['height'], height)
+            current_line['count'] += 1
+        else:
+            # New line started
+            merged_lines.append(current_line)
+            current_line = {
+                'text': text,
+                'top': top,
+                'bottom': bottom,
+                'left': left,
+                'right': right,
+                'height': height,
+                'count': 1
+            }
+            
+    if current_line:
+        merged_lines.append(current_line)
+        
+    # Convert back to standard block format for the rest of the app
+    final_blocks = []
+    for line in merged_lines:
+        width = line['right'] - line['left']
+        cx = line['left'] + (width / 2)
+        area = width * line['height']
+        
+        final_blocks.append({
+            'text': line['text'],
+            'h': line['height'],
+            'cx': cx,
+            'y_top': line['top'],
+            'y_bottom': line['bottom'],
+            'area': area
+        })
+        
+    return final_blocks
 
 def analyze_image_features(image_bytes, face_cascade, ocr_reader):
     try:
@@ -63,14 +147,12 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif texture_score < 60: visual_style = "Mixed"
         else: visual_style = "3D / Photo"
 
-        # --- PRODUCT DETECTION (Right-Side Focus) ---
+        # --- PRODUCT DETECTION ---
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blurred, 50, 150)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         
-        # ** CRITICAL: Mask Left 40% **
-        # We assume product is on the right, text is on the left.
         roi_start_x = int(width * 0.40) 
         closed[:, :roi_start_x] = 0 
         
@@ -93,101 +175,86 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif product_area_pct < 40: product_size_bucket = "Medium (15-40%)"
         else: product_size_bucket = "Large (>40%)"
 
-        # --- CONTRAST & BACKGROUND ---
-        # If edge detection worked, use the mask.
-        if cv2.countNonZero(product_mask) > 0:
+        # --- CONTRAST ---
+        if cv2.countNonZero(product_mask) == 0:
+            bg_brightness = np.mean(gray)
+            contrast_val = 0
+            bg_label = "Unknown"
+        else:
             prod_brightness = cv2.mean(gray, mask=product_mask)[0]
             bg_mask = cv2.bitwise_not(product_mask)
             bg_brightness = cv2.mean(gray, mask=bg_mask)[0]
-        else:
-            # FALLBACK: If no product found (e.g. white on white), 
-            # assume Center-Right is product, Top-Left is background.
-            prod_crop = gray[int(height*0.2):int(height*0.8), int(width*0.5):width]
-            prod_brightness = np.mean(prod_crop)
+            contrast_val = abs(prod_brightness - bg_brightness)
             
-            bg_crop = gray[0:int(height*0.2), 0:int(width*0.4)]
-            bg_brightness = np.mean(bg_crop)
-            
-            # Adjust "Size" label since detection failed
-            product_size_bucket = "Undetected (Low Contrast)"
-
-        contrast_val = abs(prod_brightness - bg_brightness)
-        
-        if bg_brightness < 90: bg_label = "Dark Background"
-        elif bg_brightness < 170: bg_label = "Medium Background"
-        else: bg_label = "Light/White Background"
+            if bg_brightness < 90: bg_label = "Dark Background"
+            elif bg_brightness < 170: bg_label = "Medium Background"
+            else: bg_label = "Light/White Background"
 
         if contrast_val < 40: contrast_label = "Low Contrast"
         elif contrast_val < 90: contrast_label = "Medium Contrast"
         else: contrast_label = "High Contrast"
 
-        # --- TEXT ANALYSIS (Fixed for Paragraph Mode) ---
-        # paragraph=True returns [[box, text], ...] OR [[box, text, conf], ...]
-        ocr_results = ocr_reader.readtext(image_cv, detail=1, paragraph=True)
+        # --- TEXT ANALYSIS ---
+        image_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
+        ocr_results = ocr_reader.readtext(image_rgb, detail=1, paragraph=False)
         
-        all_text_parts = []
-        text_blocks = [] 
+        # Merge words into lines
+        text_blocks = merge_text_blocks(ocr_results, width)
         
-        headline_text = "None"
-        max_score = 0
+        raw_text_full = " ".join([b['text'] for b in text_blocks])
+        cleaned_text = raw_text_full.upper()
         
-        boost_keywords = ["BATTERY", "HRS", "DAYS", "PROCESSOR", "RAM", "SSD", "CAMERA", "DISPLAY", "WARRANTY", "FREE", "OFF", "SALE"]
+        # --- Regex Setup (Updated for Monthly) ---
+        # Common suffix pattern for monthly: /M, /MO, /MONTH, PER MONTH
+        price_suffix = r"(?:/-|/M|/MO|/MONTH|\s+PER\s+MONTH)?"
+        
+        # Hook Price: "FROM ₹7,774/M"
+        hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+" + price_suffix + r")")
+        
+        # Loose Price: "₹7,774/M"
+        loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+" + price_suffix + r")")
+        
+        # Offer: "10% OFF"
+        offer_regex = re.compile(r"(\d{1,2}\s?% (?:OFF)?|SALE|FREE SHIPPING|FREE|BOGO|DEAL|OFFER|FLAT \d+%)")
+        
+        # Find Callout Position
         callout_y_top = float('inf')
         has_callout_block = False
         
-        hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+(?:/-)?)")
-        loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+(?:/-)?)")
-        offer_regex = re.compile(r"(\d{1,2}\s?% (?:OFF)?|SALE|FREE SHIPPING|FREE|BOGO|DEAL|OFFER|FLAT \d+%)")
-
-        for result in ocr_results:
-            # Handle variable return length from EasyOCR
-            bbox = result[0]
-            text = result[1]
-            
-            all_text_parts.append(text)
-            text_clean = text.upper()
-            
-            tl, tr, br, bl = bbox
-            box_width = tr[0] - tl[0]
-            box_height = bl[1] - tl[1]
-            box_area = box_width * box_height
-            box_center_x = (tl[0] + tr[0]) / 2
-            box_top_y = tl[1]
-            box_bottom_y = bl[1]
-            
+        for b in text_blocks:
+            txt_upper = b['text'].upper()
             is_callout = False
-            if hook_price_regex.search(text_clean) or loose_price_regex.search(text_clean) or offer_regex.search(text_clean):
+            if hook_price_regex.search(txt_upper) or loose_price_regex.search(txt_upper) or offer_regex.search(txt_upper):
                 is_callout = True
                 has_callout_block = True
-                if box_top_y < callout_y_top:
-                    callout_y_top = box_top_y
+                if b['y_top'] < callout_y_top:
+                    callout_y_top = b['y_top']
+            b['is_callout'] = is_callout
 
-            text_blocks.append({
-                'text': text,
-                'h': box_height,
-                'cx': box_center_x,
-                'y_top': box_top_y,
-                'y_bottom': box_bottom_y,
-                'area': box_area
-            })
-
-            # Smart Headline Score
-            score = box_area
-            for keyword in boost_keywords:
-                if keyword in text_clean:
-                    score *= 1.5
+        # --- 1. CONSTRUCT HEADLINE (BENEFIT) ---
+        boost_keywords = ["BATTERY", "HRS", "DAYS", "PROCESSOR", "RAM", "SSD", "CAMERA", "DISPLAY", "WARRANTY", "FREE", "OFF", "SALE"]
+        
+        max_score = 0
+        headline_text = "None"
+        
+        for b in text_blocks:
+            if b['is_callout']: continue
+            
+            score = b['area']
+            txt_upper = b['text'].upper()
+            for k in boost_keywords:
+                if k in txt_upper:
+                    score *= 2.0 
                     break
+            
             if score > max_score:
                 max_score = score
-                headline_text = text
-
-        raw_text_full = " ".join(all_text_parts)
-        cleaned_text = raw_text_full.upper()
-        
-        # --- TITLE DETECTION ---
+                headline_text = b['text']
+            
+        # --- 2. TITLE DETECTION ---
         title_text = "None"
+        
         if has_callout_block:
-            # A: Text strictly above callout
             candidates = [b for b in text_blocks if b['y_bottom'] < callout_y_top]
             candidates.sort(key=lambda x: x['y_bottom'], reverse=True)
             for cand in candidates:
@@ -196,10 +263,11 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
                     break
         
         if title_text == "None":
-            # B: Largest Font on Left
             max_title_h = 0
             for b in text_blocks:
-                if b['cx'] < (width * 0.60) and (height * 0.10) < b['y_bottom'] < (height * 0.90):
+                is_left = b['cx'] < (width * 0.60)
+                is_middle = (height * 0.10) < b['y_bottom'] < (height * 0.90)
+                if is_left and is_middle:
                     if b['h'] > max_title_h:
                         max_title_h = b['h']
                         title_text = b['text']
@@ -211,7 +279,6 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
         hook_match = hook_price_regex.search(cleaned_text)
         loose_match = loose_price_regex.search(cleaned_text)
-        suffix_match = re.compile(r"([\d,.]+/-)").search(cleaned_text)
         offer_match = offer_regex.search(cleaned_text)
         
         if hook_match:
@@ -220,9 +287,6 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif loose_match:
             callout_type = "Price Only"
             extracted_price = loose_match.group(1)
-        elif suffix_match:
-            callout_type = "Price Only"
-            extracted_price = suffix_match.group(1)
         
         if offer_match:
             if "Price" in callout_type: callout_type = "Price + Offer"
@@ -238,7 +302,6 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             "headline_text": headline_text,
             "bg_label": bg_label,
             "contrast_label": contrast_label,
-            "contrast_val": round(contrast_val, 1),
             "product_area_pct": product_area_pct,
             "product_size_bucket": product_size_bucket,
             "visual_style": visual_style,
@@ -256,11 +319,19 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
 def display_full_data(df_sorted, metric, image_name_col):
     st.markdown("--- \n ## 3. Detailed Data")
-    cols = [image_name_col, metric, 'title_text', 'headline_text', 'extracted_price', 'extracted_offer', 'bg_label', 'contrast_label', 'product_area_pct', 'has_face']
+    cols = [
+        image_name_col, metric, 
+        'title_text', 'headline_text', 
+        'extracted_price', 'extracted_offer',
+        'bg_label', 'contrast_label',
+        'product_area_pct', 'has_face'
+    ]
     cols = [c for c in cols if c in df_sorted.columns]
+    
     display_df = df_sorted[cols].copy()
     if 'product_area_pct' in display_df.columns:
         display_df['product_area_pct'] = display_df['product_area_pct'].apply(lambda x: f"{x:.1f}%" if isinstance(x, (int, float)) else x)
+
     st.dataframe(display_df, use_container_width=True)
 
 def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
@@ -278,16 +349,6 @@ def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
             face_counts = above_bench_df['has_face'].astype(str).value_counts(normalize=True)
             st.bar_chart(face_counts.reindex(['True', 'False']).fillna(0))
     
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("### Contrast")
-        if not above_bench_df.empty:
-            st.bar_chart(above_bench_df['contrast_label'].value_counts(normalize=True))
-    with col2:
-        st.markdown("### Product Size")
-        if not above_bench_df.empty:
-            st.bar_chart(above_bench_df['product_size_bucket'].value_counts(normalize=True))
-
     st.markdown("### Top Text Elements")
     def get_top_phrases(series):
         counts = Counter(series.dropna()).most_common(5)
