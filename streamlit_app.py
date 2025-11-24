@@ -16,7 +16,6 @@ def load_models():
     """Loads OpenCV and EasyOCR models into memory."""
     print("Loading models...")
     
-    # Use 'alt2' model for better face detection
     cascade_filename = 'haarcascade_frontalface_alt2.xml'
     cascade_url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_alt2.xml"
     
@@ -67,31 +66,22 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif brightness < 180: brightness_level = "Medium (Balanced)"
         else: brightness_level = "High (Bright)"
 
-        # --- Visual Style (2D vs 3D) ---
+        # --- Visual Style ---
         texture_score = np.std(gray)
         if texture_score < 40: visual_style = "2D / Flat"
         elif texture_score < 60: visual_style = "Mixed"
         else: visual_style = "3D / Photo"
 
-        # --- ROBUST PRODUCT DETECTION (Right-Side Focus) ---
-        # 1. Blur to reduce noise
+        # --- ROBUST PRODUCT DETECTION (Morphological Method) ---
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # 2. Edge Detection
         edges = cv2.Canny(blurred, 50, 150)
-        
-        # 3. Morphological Closing (Connect the edges into a blob)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         
-        # --- NEW: MASK THE LEFT SIDE ---
-        # We zero out the left 40% of the processed image to ensure we only 
-        # find product contours on the right side (where products usually are).
-        # This prevents large text on the left from being counted as "Product".
+        # MASK LEFT SIDE (Assume product is on the right)
         roi_start_x = int(width * 0.40) 
         closed[:, :roi_start_x] = 0 
         
-        # 4. Find Contours & Create Mask
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         product_mask = np.zeros_like(gray)
@@ -101,9 +91,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             for c in contours:
                 area = cv2.contourArea(c)
                 x, y, fw, fh = cv2.boundingRect(c)
-                # Ignore borders (>95%) and tiny noise (<2%)
                 is_border = (fw > 0.95 * width) or (fh > 0.95 * height)
-                
                 if area > (0.02 * total_area) and not is_border:
                     significant_area += area
                     cv2.drawContours(product_mask, [c], -1, 255, -1)
@@ -120,12 +108,9 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             contrast_val = 0
             bg_label = "Unknown"
         else:
-            # Brightness INSIDE mask (Product)
             prod_brightness = cv2.mean(gray, mask=product_mask)[0]
-            # Brightness OUTSIDE mask (Background)
             bg_mask = cv2.bitwise_not(product_mask)
             bg_brightness = cv2.mean(gray, mask=bg_mask)[0]
-            
             contrast_val = abs(prod_brightness - bg_brightness)
             
             if bg_brightness < 90: bg_label = "Dark Background"
@@ -136,33 +121,50 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif contrast_val < 90: contrast_label = "Medium Contrast"
         else: contrast_label = "High Contrast"
 
-        # --- OCR Features ---
-        ocr_results = ocr_reader.readtext(image_cv, detail=1, paragraph=False)
+        # --- SMART HEADLINE DETECTION ---
+        # Read text with coordinates
+        ocr_results = ocr_reader.readtext(image_cv, detail=1, paragraph=True) 
+        # paragraph=True merges lines that are close together! This fixes the fragmentation.
         
-        all_text_parts = []
-        max_font_height = 0
-        max_text_length = 0
         headline_text = "None"
-        main_body_text = "None"
+        max_score = 0
+        all_text_parts = []
         
+        # Keywords that boost importance
+        boost_keywords = ["BATTERY", "HRS", "DAYS", "PROCESSOR", "RAM", "SSD", "CAMERA", "DISPLAY", "WARRANTY", "FREE"]
+
         for (bbox, text, prob) in ocr_results:
             all_text_parts.append(text)
             
-            # Headline (Height)
+            # Calculate Box Dimensions
+            # bbox = [[tl], [tr], [br], [bl]]
+            box_width = bbox[1][0] - bbox[0][0]
             box_height = bbox[2][1] - bbox[0][1]
-            if box_height > max_font_height:
-                max_font_height = box_height
-                headline_text = text
+            box_area = box_width * box_height
             
-            # Main Text (Length)
-            if len(text) > max_text_length and len(text) > 3:
-                max_text_length = len(text)
-                main_body_text = text
+            # Scoring Logic:
+            # Base Score = Visual Area (Height * Width)
+            score = box_area
+            
+            # Boost if it contains a Feature Keyword
+            text_upper = text.upper()
+            for keyword in boost_keywords:
+                if keyword in text_upper:
+                    score *= 1.5 # 50% Boost for feature-rich text
+                    break
+            
+            # Penalize very short text (like "ASUS" logo)
+            if len(text) < 5:
+                score *= 0.5
+
+            if score > max_score:
+                max_score = score
+                headline_text = text
 
         raw_text = " ".join(all_text_parts)
         cleaned_text = raw_text.upper()
         
-        # --- PRICE EXTRACTION (Smart) ---
+        # --- PRICE EXTRACTION ---
         hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+(?:/-)?)")
         loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+(?:/-)?)")
         suffix_price_regex = re.compile(r"([\d,.]+/-)")
@@ -197,11 +199,10 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             extracted_price = re.sub(r"([A-Z])(₹)", r"\1 \2", extracted_price)
 
         return {
+            "headline_text": headline_text, # Now powered by Area + Keywords
             "bg_label": bg_label,
             "contrast_label": contrast_label,
             "contrast_val": round(contrast_val, 1),
-            "headline_text": headline_text,
-            "main_body_text": main_body_text,
             "product_area_pct": product_area_pct,
             "product_size_bucket": product_size_bucket,
             "visual_style": visual_style,
@@ -219,12 +220,13 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 # --- 2. REPORTING UI ---
 
 def display_full_data(df_sorted, metric, image_name_col):
-    st.markdown("--- \n ## 3. Detailed Data") 
+    st.markdown("--- \n ## 3. Detailed Data")
     
     cols = [
         image_name_col, metric, 
+        'headline_text', # This will now show the smart headline
         'bg_label', 'contrast_label',
-        'product_area_pct', 'main_body_text', 'headline_text',
+        'product_area_pct', 
         'extracted_price', 'extracted_offer', 
         'has_face', 'visual_style'
     ]
@@ -317,9 +319,9 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
             if item['image_name'] in images_dict:
                 st.image(images_dict[item['image_name']], use_column_width=True)
             
+            st.success(f"**Headline:** {item.get('headline_text', 'N/A')}")
             st.info(f"**Background:** {item.get('bg_label', '-')}")
             st.info(f"**Contrast:** {item.get('contrast_label', '-')} (Val: {item.get('contrast_val', 0)})")
-            st.success(f"**Main Text:** {item.get('main_body_text', 'N/A')}")
             st.write(f"**Product Coverage:** {item.get('product_area_pct', 0):.1f}%")
             st.write(f"**Face:** {'Yes' if item.has_face else 'No'}")
             st.write(f"**Price:** {item.extracted_price or '-'}")
@@ -345,7 +347,6 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             face_cascade, ocr_reader = load_models()
             if not face_cascade: st.stop()
 
-        # --- ROBUST CSV LOADING ---
         try:
             df = pd.read_csv(csv_file)
             if image_name_col in df.columns:
@@ -358,7 +359,6 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             st.error(f"CSV Error: {e}")
             st.stop()
 
-        # --- ROBUST IMAGE MAPPING ---
         images_dict = {f.name.strip(): f.getvalue() for f in uploaded_images}
         
         all_features = []
@@ -376,14 +376,6 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
         
         if not all_features:
             st.error("No matching images analyzed.")
-            with st.expander("Debug: Filename Mismatch Checker", expanded=True):
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.write("**Filenames in CSV (First 5):**")
-                    st.write(df[image_name_col].head(5).tolist())
-                with col_b:
-                    st.write("**Filenames Uploaded (First 5):**")
-                    st.write(list(images_dict.keys())[:5])
             st.stop()
 
         res_df = pd.DataFrame(all_features)
@@ -395,7 +387,6 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
         col1.metric(label=f"Dataset Average {metric_col}", value=f"{mean_val:.4f}")
         col2.metric(label="Benchmark Used", value=f"{benchmark_val}")
         
-        # --- 1. BEST VS WORST (First) ---
         best_worst_images = {}
         if not res_df.empty:
             best_name = res_df.iloc[0][image_name_col]
@@ -407,7 +398,6 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
         
         display_best_vs_worst(res_df, metric_col, best_worst_images)
 
-        # --- 2. AGGREGATE REPORTS (Second) ---
         display_aggregate_report(
             res_df[res_df[metric_col] > benchmark_val], 
             res_df[res_df[metric_col] <= benchmark_val], 
@@ -415,7 +405,6 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             benchmark_val
         )
         
-        # --- 3. FULL DATA TABLE (Last) ---
         display_full_data(res_df, metric_col, image_name_col)
         
     else:
