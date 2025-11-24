@@ -30,91 +30,6 @@ def load_models():
     ocr_reader = easyocr.Reader(['en'], gpu=False)
     return face_cascade, ocr_reader
 
-def merge_text_blocks(raw_results, image_width):
-    """
-    Manually groups separate words into lines based on vertical alignment.
-    Fixes the issue where 'ASUS' and 'Vivobook' are seen as different blocks.
-    """
-    if not raw_results:
-        return []
-
-    # Format: [ [bbox, text, conf], ... ]
-    # Sort by Top-Y first
-    sorted_results = sorted(raw_results, key=lambda x: x[0][0][1])
-    
-    merged_lines = []
-    current_line = []
-    
-    for res in sorted_results:
-        bbox, text, conf = res
-        tl, tr, br, bl = bbox
-        
-        # Calculate box stats
-        top = tl[1]
-        bottom = bl[1]
-        left = tl[0]
-        right = tr[0]
-        height = bottom - top
-        
-        if not current_line:
-            current_line = {
-                'text': text,
-                'top': top,
-                'bottom': bottom,
-                'left': left,
-                'right': right,
-                'height': height,
-                'count': 1
-            }
-            continue
-            
-        # Check if this word belongs on the same line
-        # Criteria: Vertical overlap > 50%
-        prev = current_line
-        vertical_overlap = min(prev['bottom'], bottom) - max(prev['top'], top)
-        overlap_ratio = vertical_overlap / min(prev['height'], height)
-        
-        if overlap_ratio > 0.5:
-            # It's on the same line, merge it
-            current_line['text'] += " " + text
-            current_line['right'] = right # Extend width
-            current_line['bottom'] = max(current_line['bottom'], bottom)
-            current_line['height'] = max(current_line['height'], height)
-            current_line['count'] += 1
-        else:
-            # New line started
-            merged_lines.append(current_line)
-            current_line = {
-                'text': text,
-                'top': top,
-                'bottom': bottom,
-                'left': left,
-                'right': right,
-                'height': height,
-                'count': 1
-            }
-            
-    if current_line:
-        merged_lines.append(current_line)
-        
-    # Convert back to standard block format for the rest of the app
-    final_blocks = []
-    for line in merged_lines:
-        width = line['right'] - line['left']
-        cx = line['left'] + (width / 2)
-        area = width * line['height']
-        
-        final_blocks.append({
-            'text': line['text'],
-            'h': line['height'],
-            'cx': cx,
-            'y_top': line['top'],
-            'y_bottom': line['bottom'],
-            'area': area
-        })
-        
-    return final_blocks
-
 def analyze_image_features(image_bytes, face_cascade, ocr_reader):
     try:
         file_bytes = np.asarray(bytearray(image_bytes), dtype=np.uint8)
@@ -196,78 +111,96 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
         # --- TEXT ANALYSIS ---
         image_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
+        
+        # Use paragraph=False for maximum control over individual lines
         ocr_results = ocr_reader.readtext(image_rgb, detail=1, paragraph=False)
         
-        # Merge words into lines
-        text_blocks = merge_text_blocks(ocr_results, width)
+        text_blocks = []
+        all_text_parts = []
         
-        raw_text_full = " ".join([b['text'] for b in text_blocks])
-        cleaned_text = raw_text_full.upper()
-        
-        # --- Regex Setup (Updated for Monthly) ---
-        # Common suffix pattern for monthly: /M, /MO, /MONTH, PER MONTH
+        # Regex (With Monthly Support)
         price_suffix = r"(?:/-|/M|/MO|/MONTH|\s+PER\s+MONTH)?"
-        
-        # Hook Price: "FROM ₹7,774/M"
         hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+" + price_suffix + r")")
-        
-        # Loose Price: "₹7,774/M"
         loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+" + price_suffix + r")")
-        
-        # Offer: "10% OFF"
         offer_regex = re.compile(r"(\d{1,2}\s?% (?:OFF)?|SALE|FREE SHIPPING|FREE|BOGO|DEAL|OFFER|FLAT \d+%)")
-        
-        # Find Callout Position
+
         callout_y_top = float('inf')
         has_callout_block = False
         
-        for b in text_blocks:
-            txt_upper = b['text'].upper()
+        headline_text = "None"
+        max_score = 0
+        boost_keywords = ["BATTERY", "HRS", "DAYS", "PROCESSOR", "RAM", "SSD", "CAMERA", "DISPLAY", "WARRANTY", "FREE", "OFF", "SALE"]
+
+        for result in ocr_results:
+            bbox, text, conf = result
+            text_clean = text.upper()
+            all_text_parts.append(text)
+            
+            tl, tr, br, bl = bbox
+            box_width = tr[0] - tl[0]
+            box_height = bl[1] - tl[1]
+            box_area = box_width * box_height
+            box_center_x = (tl[0] + tr[0]) / 2
+            box_top_y = tl[1]
+            box_bottom_y = bl[1]
+            
+            # Check Callout
             is_callout = False
-            if hook_price_regex.search(txt_upper) or loose_price_regex.search(txt_upper) or offer_regex.search(txt_upper):
+            if hook_price_regex.search(text_clean) or loose_price_regex.search(text_clean) or offer_regex.search(text_clean):
                 is_callout = True
                 has_callout_block = True
-                if b['y_top'] < callout_y_top:
-                    callout_y_top = b['y_top']
-            b['is_callout'] = is_callout
+                # Update the highest point of any callout found
+                if box_top_y < callout_y_top:
+                    callout_y_top = box_top_y
 
-        # --- 1. CONSTRUCT HEADLINE (BENEFIT) ---
-        boost_keywords = ["BATTERY", "HRS", "DAYS", "PROCESSOR", "RAM", "SSD", "CAMERA", "DISPLAY", "WARRANTY", "FREE", "OFF", "SALE"]
+            text_blocks.append({
+                'text': text,
+                'h': box_height,
+                'cx': box_center_x,
+                'y_top': box_top_y,
+                'y_bottom': box_bottom_y,
+                'area': box_area,
+                'is_callout': is_callout
+            })
+
+            # Calculate Headline (Benefit)
+            if not is_callout:
+                score = box_area
+                for keyword in boost_keywords:
+                    if keyword in text_clean:
+                        score *= 1.5
+                        break
+                if score > max_score:
+                    max_score = score
+                    headline_text = text
+
+        raw_text_full = " ".join(all_text_parts)
+        cleaned_text = raw_text_full.upper()
         
-        max_score = 0
-        headline_text = "None"
-        
-        for b in text_blocks:
-            if b['is_callout']: continue
-            
-            score = b['area']
-            txt_upper = b['text'].upper()
-            for k in boost_keywords:
-                if k in txt_upper:
-                    score *= 2.0 
-                    break
-            
-            if score > max_score:
-                max_score = score
-                headline_text = b['text']
-            
-        # --- 2. TITLE DETECTION ---
+        # --- TITLE DETECTION (Restored Logic: Line ABOVE Callout) ---
         title_text = "None"
         
         if has_callout_block:
-            candidates = [b for b in text_blocks if b['y_bottom'] < callout_y_top]
+            # 1. Find text blocks strictly ABOVE the callout line
+            candidates = [b for b in text_blocks if b['y_bottom'] < callout_y_top and not b['is_callout']]
+            
+            # 2. Sort by Y-Bottom Descending (Highest value = Closest to the callout line)
             candidates.sort(key=lambda x: x['y_bottom'], reverse=True)
+            
+            # 3. Pick the first valid candidate
             for cand in candidates:
-                if cand['cx'] < (width * 0.75) and cand['h'] > 12: 
+                # Must be somewhat on the left/center (ignore noise on far right)
+                if cand['cx'] < (width * 0.80) and cand['h'] > 10: 
                     title_text = cand['text']
                     break
         
         if title_text == "None":
+            # Fallback: Largest Font on Left
             max_title_h = 0
             for b in text_blocks:
                 is_left = b['cx'] < (width * 0.60)
                 is_middle = (height * 0.10) < b['y_bottom'] < (height * 0.90)
-                if is_left and is_middle:
+                if is_left and is_middle and not b['is_callout']:
                     if b['h'] > max_title_h:
                         max_title_h = b['h']
                         title_text = b['text']
@@ -409,7 +342,7 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
                 st.error(f"Analysis Failed: {item['error']}")
             else:
                 st.success(f"**Title:** {item.get('title_text', 'N/A')}")
-                with st.expander("See Full Text/Headline"):
+                with st.expander("See Full Headline"):
                     st.write(item.get('headline_text', 'N/A'))
                 st.info(f"**Background:** {item.get('bg_label', '-')}")
                 st.info(f"**Contrast:** {item.get('contrast_label', '-')}")
