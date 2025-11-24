@@ -78,7 +78,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         
-        # Mask Left Side for product detection logic (assuming product is usually right/center)
+        # Mask Left Side for product detection logic
         roi_start_x = int(width * 0.40) 
         closed[:, :roi_start_x] = 0 
         
@@ -120,7 +120,8 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif contrast_val < 90: contrast_label = "Medium Contrast"
         else: contrast_label = "High Contrast"
 
-        # --- TEXT ANALYSIS ---
+        # --- TEXT ANALYSIS (FIXED) ---
+        # Use paragraph=True to group lines
         ocr_results = ocr_reader.readtext(image_cv, detail=1, paragraph=True)
         
         all_text_parts = []
@@ -132,7 +133,11 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         
         boost_keywords = ["BATTERY", "HRS", "DAYS", "PROCESSOR", "RAM", "SSD", "CAMERA", "DISPLAY", "WARRANTY", "FREE", "OFF", "SALE"]
 
-        for (bbox, text, prob) in ocr_results:
+        # FIX: EasyOCR paragraph=True returns [ [bbox, text], ... ] without probability
+        for result in ocr_results:
+            bbox = result[0]
+            text = result[1]
+            
             all_text_parts.append(text)
             
             # bbox = [[tl], [tr], [br], [bl]]
@@ -226,7 +231,7 @@ def display_full_data(df_sorted, metric, image_name_col):
     st.markdown("--- \n ## 3. Detailed Data")
     cols = [
         image_name_col, metric, 
-        'title_text', 'headline_text', # Added Title
+        'title_text', 'headline_text', 
         'extracted_price', 'extracted_offer',
         'bg_label', 'contrast_label',
         'product_area_pct', 'has_face'
@@ -295,8 +300,7 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
         if name_str.lower() in img_lookup: return img_dict[img_lookup[name_str.lower()]]
         return None
 
-    # Need to rebuild lookup here or pass it in. 
-    # For simplicity, we re-create the minimal lookup needed for display
+    # Need to rebuild lookup here
     img_lookup_display = {k.lower(): k for k in images_dict.keys()}
 
     for col, item, title in [(col1, best, "🥇 Best"), (col2, worst, "🥉 Worst")]:
@@ -353,33 +357,27 @@ if st.sidebar.button("Run Analysis", use_container_width=True):
             st.stop()
 
         # --- SMART LOOKUP ---
-        # 1. Clean uploaded filenames
         images_dict = {f.name.strip(): f.getvalue() for f in uploaded_images}
-        
-        # 2. Build lookup table for relaxed matching
         images_lookup = {}
         for name in images_dict.keys():
-            images_lookup[name] = name # exact
-            images_lookup[name.lower()] = name # lowercase
+            images_lookup[name] = name 
+            images_lookup[name.lower()] = name 
             name_no_ext = os.path.splitext(name)[0]
-            images_lookup[name_no_ext] = name # no ext
-            images_lookup[name_no_ext.lower()] = name # lowercase no ext
+            images_lookup[name_no_ext] = name 
+            images_lookup[name_no_ext.lower()] = name 
 
         all_features = []
         bar = st.progress(0, text="Analyzing...")
         total_rows = len(df)
         
         for i, row in df.iterrows():
-            csv_name = row[image_name_col] # already stripped above
+            csv_name = row[image_name_col]
             
             # Try matching
             target_key = None
-            if csv_name in images_dict:
-                target_key = csv_name
-            elif csv_name.lower() in images_lookup:
-                target_key = images_lookup[csv_name.lower()]
-            elif csv_name in images_lookup:
-                target_key = images_lookup[csv_name]
+            if csv_name in images_dict: target_key = csv_name
+            elif csv_name.lower() in images_lookup: target_key = images_lookup[csv_name.lower()]
+            elif csv_name in images_lookup: target_key = images_lookup[csv_name]
                 
             if target_key:
                 feats = analyze_image_features(images_dict[target_key], face_cascade, ocr_reader)
