@@ -72,13 +72,13 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif texture_score < 60: visual_style = "Mixed"
         else: visual_style = "3D / Photo"
 
-        # --- PRODUCT DETECTION (Morphological) ---
+        # --- PRODUCT DETECTION ---
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blurred, 50, 150)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         
-        # Mask Left Side for product detection logic
+        # Mask Left Side for product detection
         roi_start_x = int(width * 0.40) 
         closed[:, :roi_start_x] = 0 
         
@@ -120,64 +120,102 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif contrast_val < 90: contrast_label = "Medium Contrast"
         else: contrast_label = "High Contrast"
 
-        # --- TEXT ANALYSIS (FIXED) ---
+        # --- REGEX DEFINITIONS ---
+        # We define these early to use them inside the loop
+        hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+(?:/-)?)")
+        loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+(?:/-)?)")
+        offer_regex = re.compile(r"(\d{1,2}\s?% (?:OFF)?|SALE|FREE SHIPPING|FREE|BOGO|DEAL|OFFER|FLAT \d+%)")
+
+        # --- TEXT ANALYSIS ---
         # Use paragraph=True to group lines
         ocr_results = ocr_reader.readtext(image_cv, detail=1, paragraph=True)
         
         all_text_parts = []
-        headline_text = "None" # This is the "Benefit" headline (Smart Score)
-        title_text = "None"    # This is the "Product Title" (Font Size + Position)
+        text_blocks = [] # Store metadata for title logic
         
+        headline_text = "None"
         max_score = 0
-        max_title_height = 0
-        
         boost_keywords = ["BATTERY", "HRS", "DAYS", "PROCESSOR", "RAM", "SSD", "CAMERA", "DISPLAY", "WARRANTY", "FREE", "OFF", "SALE"]
 
-        # FIX: EasyOCR paragraph=True returns [ [bbox, text], ... ] without probability
+        callout_y_top = float('inf') # Track the highest point of any callout found
+        has_callout_block = False
+
         for result in ocr_results:
             bbox = result[0]
             text = result[1]
-            
             all_text_parts.append(text)
+            text_clean = text.upper()
             
-            # bbox = [[tl], [tr], [br], [bl]]
+            # Geometry
             tl, tr, br, bl = bbox
             box_width = tr[0] - tl[0]
             box_height = bl[1] - tl[1]
-            box_center_x = (tl[0] + tr[0]) / 2
-            box_center_y = (tl[1] + bl[1]) / 2
             box_area = box_width * box_height
+            box_center_x = (tl[0] + tr[0]) / 2
+            box_top_y = tl[1]
+            box_bottom_y = bl[1]
             
-            # --- 1. Find "Smart Headline" (Benefit) ---
+            # Check if this block IS the callout/price
+            is_callout = False
+            if hook_price_regex.search(text_clean) or loose_price_regex.search(text_clean) or offer_regex.search(text_clean):
+                is_callout = True
+                has_callout_block = True
+                if box_top_y < callout_y_top:
+                    callout_y_top = box_top_y # Mark the top boundary of the callout section
+
+            # Store for later Title logic
+            text_blocks.append({
+                'text': text,
+                'is_callout': is_callout,
+                'h': box_height,
+                'cx': box_center_x,
+                'y_bottom': box_bottom_y,
+                'area': box_area
+            })
+
+            # --- Smart Headline (Benefit) Logic ---
             score = box_area
-            text_upper = text.upper()
             for keyword in boost_keywords:
-                if keyword in text_upper:
+                if keyword in text_clean:
                     score *= 1.5
                     break
             if score > max_score:
                 max_score = score
-                headline_text = text # This captures "Up to 28 hrs battery"
-
-            # --- 2. Find "Title" (Product Name) ---
-            # Criteria: Left Side, Not Top Logo, Not Bottom Disclaimer, Big Font
-            is_left = box_center_x < (width * 0.60)
-            is_middle_vertical = (height * 0.15) < box_center_y < (height * 0.85)
-            
-            if is_left and is_middle_vertical:
-                if box_height > max_title_height:
-                    max_title_height = box_height
-                    title_text = text # This captures "ASUS Vivobook S series"
+                headline_text = text
 
         raw_text = " ".join(all_text_parts)
         cleaned_text = raw_text.upper()
         
-        # --- PRICE EXTRACTION ---
-        hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+(?:/-)?)")
-        loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+(?:/-)?)")
-        suffix_price_regex = re.compile(r"([\d,.]+/-)")
-        offer_regex = re.compile(r"(\d{1,2}\s?% (?:OFF)?|SALE|FREE SHIPPING|FREE|BOGO|DEAL|OFFER|FLAT \d+%)")
+        # --- TITLE DETECTION LOGIC (Updated) ---
+        title_text = "None"
         
+        if has_callout_block:
+            # Strategy A: Find the text block strictly ABOVE the callout
+            # Filter blocks that are above the callout line
+            candidates = [b for b in text_blocks if b['y_bottom'] < callout_y_top]
+            
+            # Sort by Y (lowest Y-bottom first -> closest to callout)
+            candidates.sort(key=lambda x: x['y_bottom'], reverse=True)
+            
+            # Pick the first reasonable candidate
+            for cand in candidates:
+                # Heuristic: Must be on left-ish side and not tiny
+                if cand['cx'] < (width * 0.75) and cand['h'] > 15: 
+                    title_text = cand['text']
+                    break
+        
+        if title_text == "None":
+            # Strategy B: Fallback to Largest Font on Left (if no callout found or Strategy A failed)
+            max_title_h = 0
+            for b in text_blocks:
+                is_left = b['cx'] < (width * 0.60)
+                is_middle = (height * 0.10) < b['y_bottom'] < (height * 0.90)
+                if is_left and is_middle:
+                    if b['h'] > max_title_h:
+                        max_title_h = b['h']
+                        title_text = b['text']
+
+        # --- PRICE EXTRACTION ---
         callout_type = "None"
         extracted_price = None
         extracted_offer = None
