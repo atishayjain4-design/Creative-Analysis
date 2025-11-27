@@ -195,7 +195,8 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
                         title_text = b['text']
 
         # --- PRICE EXTRACTION ---
-        raw_text_full = headline_text # Use the constructed headline for regex search
+        # Use ALL detected text blocks for extraction, not just the headline, to ensure small offers are caught
+        raw_text_full = " ".join([b['text'] for b in text_blocks])
         cleaned_text = raw_text_full.upper()
         
         callout_type = "None"
@@ -204,6 +205,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
         hook_match = hook_price_regex.search(cleaned_text)
         loose_match = loose_price_regex.search(cleaned_text)
+        suffix_match = re.compile(r"([\d,.]+/-)").search(cleaned_text)
         offer_match = offer_regex.search(cleaned_text)
         
         if hook_match:
@@ -212,6 +214,9 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         elif loose_match:
             callout_type = "Price Only"
             extracted_price = loose_match.group(1)
+        elif suffix_match:
+            callout_type = "Price Only"
+            extracted_price = suffix_match.group(1)
         
         if offer_match:
             if "Price" in callout_type: callout_type = "Price + Offer"
