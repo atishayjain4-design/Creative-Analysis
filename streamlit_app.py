@@ -20,6 +20,7 @@ def load_models():
     cascade_url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_alt2.xml"
     
     if not os.path.exists(cascade_filename):
+        print(f"Model not found. Downloading {cascade_filename}...")
         try:
             urllib.request.urlretrieve(cascade_url, cascade_filename)
         except Exception as e:
@@ -68,7 +69,6 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)) 
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         
-        # Mask Left Side for product detection logic
         roi_start_x = int(width * 0.40) 
         closed[:, :roi_start_x] = 0 
         
@@ -112,12 +112,9 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
         # --- TEXT ANALYSIS ---
         image_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
-        
-        # Use paragraph=False for maximum control over individual lines
         ocr_results = ocr_reader.readtext(image_rgb, detail=1, paragraph=False)
         
         text_blocks = []
-        all_text_parts = []
         
         # Regex (With Monthly Support)
         price_suffix = r"(?:/-|/M|/MO|/MONTH|\s+PER\s+MONTH)?"
@@ -129,13 +126,10 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         has_callout_block = False
         
         headline_text = "None"
-        max_score = 0
-        boost_keywords = ["BATTERY", "HRS", "DAYS", "PROCESSOR", "RAM", "SSD", "CAMERA", "DISPLAY", "WARRANTY", "FREE", "OFF", "SALE"]
 
         for result in ocr_results:
             bbox, text, conf = result
             text_clean = text.upper()
-            all_text_parts.append(text)
             
             tl, tr, br, bl = bbox
             box_width = tr[0] - tl[0]
@@ -150,7 +144,6 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             if hook_price_regex.search(text_clean) or loose_price_regex.search(text_clean) or offer_regex.search(text_clean):
                 is_callout = True
                 has_callout_block = True
-                # Update the highest point of any callout found
                 if box_top_y < callout_y_top:
                     callout_y_top = box_top_y
 
@@ -164,39 +157,34 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
                 'is_callout': is_callout
             })
 
-            # Calculate Headline (Benefit)
-            if not is_callout:
-                score = box_area
-                for keyword in boost_keywords:
-                    if keyword in text_clean:
-                        score *= 1.5
-                        break
-                if score > max_score:
-                    max_score = score
-                    headline_text = text
-
-        raw_text_full = " ".join(all_text_parts)
-        cleaned_text = raw_text_full.upper()
+        # --- 1. CONSTRUCT HEADLINE (ALL TEXT) ---
+        # We define "Headline" here as the aggregation of ALL significant text on the image
+        # Filter: Height > 15px to ignore tiny noise
+        significant_blocks = [b for b in text_blocks if b['h'] > 15]
         
-        # --- TITLE DETECTION (Restored Logic: Line ABOVE Callout) ---
+        # Sort Top-to-Bottom so it reads naturally
+        significant_blocks.sort(key=lambda x: x['y_top'])
+        
+        if significant_blocks:
+            headline_text = " | ".join([b['text'] for b in significant_blocks])
+        else:
+            headline_text = "None"
+
+        # --- 2. TITLE DETECTION ---
         title_text = "None"
         
         if has_callout_block:
-            # 1. Find text blocks strictly ABOVE the callout line
+            # Strategy A: Text strictly above the callout
             candidates = [b for b in text_blocks if b['y_bottom'] < callout_y_top and not b['is_callout']]
-            
-            # 2. Sort by Y-Bottom Descending (Highest value = Closest to the callout line)
             candidates.sort(key=lambda x: x['y_bottom'], reverse=True)
             
-            # 3. Pick the first valid candidate
             for cand in candidates:
-                # Must be somewhat on the left/center (ignore noise on far right)
-                if cand['cx'] < (width * 0.80) and cand['h'] > 10: 
+                if cand['cx'] < (width * 0.75) and cand['h'] > 10: 
                     title_text = cand['text']
                     break
         
         if title_text == "None":
-            # Fallback: Largest Font on Left
+            # Strategy B: Largest Font on Left
             max_title_h = 0
             for b in text_blocks:
                 is_left = b['cx'] < (width * 0.60)
@@ -207,6 +195,9 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
                         title_text = b['text']
 
         # --- PRICE EXTRACTION ---
+        raw_text_full = headline_text # Use the constructed headline for regex search
+        cleaned_text = raw_text_full.upper()
+        
         callout_type = "None"
         extracted_price = None
         extracted_offer = None
@@ -233,7 +224,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
         return {
             "title_text": title_text,       
-            "headline_text": headline_text,
+            "headline_text": headline_text, # Contains ALL significant text
             "bg_label": bg_label,
             "contrast_label": contrast_label,
             "product_area_pct": product_area_pct,
@@ -283,7 +274,6 @@ def display_aggregate_report(above_bench_df, below_bench_df, metric, benchmark):
             face_counts = above_bench_df['has_face'].astype(str).value_counts(normalize=True)
             st.bar_chart(face_counts.reindex(['True', 'False']).fillna(0))
     
-    # --- NEW SECTION: Contrast & Size ---
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("### Contrast Level")
@@ -363,12 +353,12 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
                 st.error(f"Analysis Failed: {item['error']}")
             else:
                 st.success(f"**Title:** {item.get('title_text', 'N/A')}")
-                with st.expander("See Full Headline"):
+                with st.expander("See Full Headline/Copy"):
                     st.write(item.get('headline_text', 'N/A'))
                 st.info(f"**Background:** {item.get('bg_label', '-')}")
-                st.info(f"**Contrast:** {item.get('contrast_label', '-')} ({item.get('contrast_val', 0):.1f})")
-                st.write(f"**Product Size:** {item.get('product_size_bucket', 'N/A')} ({item.get('product_area_pct', 0):.1f}%)")
+                st.info(f"**Contrast:** {item.get('contrast_label', '-')}")
                 st.write(f"**Face:** {'Yes' if item.has_face else 'No'}")
+                st.write(f"**Product Size:** {item.get('product_size_bucket', 'N/A')} ({item.get('product_area_pct', 0):.1f}%)")
                 st.write(f"**Price:** {item.extracted_price or '-'}")
                 st.write(f"**Offer:** {item.extracted_offer or '-'}")
 
