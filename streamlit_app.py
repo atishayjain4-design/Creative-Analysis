@@ -115,8 +115,8 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         ocr_results = ocr_reader.readtext(image_rgb, detail=1, paragraph=False)
         
         text_blocks = []
-        all_text_parts = []
         
+        # Regex (With Monthly Support)
         price_suffix = r"(?:/-|/M|/MO|/MONTH|\s+PER\s+MONTH)?"
         hook_price_regex = re.compile(r"((?:FROM|STARTS?|STARTING|JUST|ONLY|NOW|AT|@)\s*(?:[^0-9\s]{0,3})\s*[\d,.]+" + price_suffix + r")")
         loose_price_regex = re.compile(r"((?:₹|\$|€|£|RS\.?|INR|\?)\s*[\d,.]+" + price_suffix + r")")
@@ -126,13 +126,10 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
         has_callout_block = False
         
         headline_text = "None"
-        max_score = 0
-        boost_keywords = ["BATTERY", "HRS", "DAYS", "PROCESSOR", "RAM", "SSD", "CAMERA", "DISPLAY", "WARRANTY", "FREE", "OFF", "SALE"]
 
         for result in ocr_results:
             bbox, text, conf = result
             text_clean = text.upper()
-            all_text_parts.append(text)
             
             tl, tr, br, bl = bbox
             box_width = tr[0] - tl[0]
@@ -142,6 +139,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
             box_top_y = tl[1]
             box_bottom_y = bl[1]
             
+            # Check Callout
             is_callout = False
             if hook_price_regex.search(text_clean) or loose_price_regex.search(text_clean) or offer_regex.search(text_clean):
                 is_callout = True
@@ -159,57 +157,48 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
                 'is_callout': is_callout
             })
 
-            # Smart Headline
-            if not is_callout:
-                score = box_area
-                for keyword in boost_keywords:
-                    if keyword in text_clean:
-                        score *= 1.5
-                        break
-                if score > max_score:
-                    max_score = score
-                    headline_text = text
-
-        raw_text_full = " ".join(all_text_parts)
-        cleaned_text = raw_text_full.upper()
+        # --- 1. CONSTRUCT HEADLINE (ALL TEXT) ---
+        # We define "Headline" here as the aggregation of ALL significant text on the image
+        # Filter: Height > 15px to ignore tiny noise
+        significant_blocks = [b for b in text_blocks if b['h'] > 15]
         
-        # --- TITLE DETECTION (With Garbage Filter) ---
+        # Sort Top-to-Bottom so it reads naturally
+        significant_blocks.sort(key=lambda x: x['y_top'])
+        
+        if significant_blocks:
+            headline_text = " | ".join([b['text'] for b in significant_blocks])
+        else:
+            headline_text = "None"
+
+        # --- 2. TITLE DETECTION ---
         title_text = "None"
         
         if has_callout_block:
-            # Candidates strictly ABOVE callout
+            # Strategy A: Text strictly above the callout
             candidates = [b for b in text_blocks if b['y_bottom'] < callout_y_top and not b['is_callout']]
-            # Sort by closest to callout first
             candidates.sort(key=lambda x: x['y_bottom'], reverse=True)
             
             for cand in candidates:
-                # CLEAN: Remove extra spaces
-                clean_t = cand['text'].strip()
-                # FILTER: Must have at least one letter (A-Z) and be > 3 chars
-                has_letters = any(c.isalpha() for c in clean_t)
-                is_short = len(clean_t) < 3
-                
-                # Heuristic: Left-ish, decent height, valid text
-                if cand['cx'] < (width * 0.80) and cand['h'] > 10 and has_letters and not is_short: 
+                if cand['cx'] < (width * 0.75) and cand['h'] > 10: 
                     title_text = cand['text']
                     break
         
         if title_text == "None":
-            # Fallback: Largest Font on Left
+            # Strategy B: Largest Font on Left
             max_title_h = 0
             for b in text_blocks:
                 is_left = b['cx'] < (width * 0.60)
                 is_middle = (height * 0.10) < b['y_bottom'] < (height * 0.90)
-                
-                clean_t = b['text'].strip()
-                has_letters = any(c.isalpha() for c in clean_t)
-                
-                if is_left and is_middle and not b['is_callout'] and has_letters:
+                if is_left and is_middle and not b['is_callout']:
                     if b['h'] > max_title_h:
                         max_title_h = b['h']
                         title_text = b['text']
 
         # --- PRICE EXTRACTION ---
+        # Use ALL detected text blocks for extraction, not just the headline, to ensure small offers are caught
+        raw_text_full = " ".join([b['text'] for b in text_blocks])
+        cleaned_text = raw_text_full.upper()
+        
         callout_type = "None"
         extracted_price = None
         extracted_offer = None
@@ -240,7 +229,7 @@ def analyze_image_features(image_bytes, face_cascade, ocr_reader):
 
         return {
             "title_text": title_text,       
-            "headline_text": headline_text,
+            "headline_text": headline_text, # Contains ALL significant text
             "bg_label": bg_label,
             "contrast_label": contrast_label,
             "product_area_pct": product_area_pct,
@@ -369,7 +358,7 @@ def display_best_vs_worst(df_sorted, metric, images_dict):
                 st.error(f"Analysis Failed: {item['error']}")
             else:
                 st.success(f"**Title:** {item.get('title_text', 'N/A')}")
-                with st.expander("See Full Headline"):
+                with st.expander("See Full Headline/Copy"):
                     st.write(item.get('headline_text', 'N/A'))
                 st.info(f"**Background:** {item.get('bg_label', '-')}")
                 st.info(f"**Contrast:** {item.get('contrast_label', '-')}")
